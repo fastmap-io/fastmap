@@ -7,14 +7,14 @@ _global_config = None
 
 
 @set_docstring(FASTMAP_INIT_DOCSTRING, "Initialize fastmap globally. Also see fastmap_init.")
-def fastmap_global_init(**kwargs):
+def fastmap_global_init(token, **kwargs):
     global _global_config
-    _global_config = fastmap_init(**kwargs)
+    _global_config = fastmap_init(token, **kwargs)
 
 
-@set_docstring(FASTMAP_INIT_DOCSTRING, "Initialize a reusable FastmapConfig object with a .fastmap(...) method. Also see fastmap_global_init.")
-def fastmap_init(**kwargs):
-    return FastmapConfig(**kwargs)
+@set_docstring(FASTMAP_INIT_DOCSTRING, "Initialize a reusable FastmapConfig object. Also see fastmap_global_init.")
+def fastmap_init(token, **kwargs):
+    return FastmapConfig(token, **kwargs)
 
 
 @set_docstring(FASTMAP_DOCSTRING)
