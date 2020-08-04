@@ -1,19 +1,12 @@
 import base64
-import hashlib
 import logging
-# import json
-import threading
-# import time
-# import urllib
-from enum import Enum
-from multiprocessing import Pool, cpu_count
-from timeit import timeit
+from multiprocessing import Pool
 
 # import capnp
 # import fastmap_capnp
 import dill
-# import psutil
-import requests
+import psutil
+from requests_futures.sessions import FuturesSession
 
 _transfer_durs = {}
 dill.settings['recurse'] = True
@@ -52,29 +45,6 @@ FASTMAP_INIT_DOCSTRING = """
     """
 
 
-
-# def get_json(url):
-#     f = urllib.request.urlopen(url)
-#     return json.loads(f.read().decode('utf-8'))
-
-
-# def post_json(url, obj):
-#     if not isinstance(obj, str):
-#         obj = json.dumps(obj)
-#     data = urllib.parse.urlencode(obj).encode()
-#     req = urllib.request.Request(url, data=data)
-#     return json.loads(urllib.request.urlopen(req))
-
-
-def set_interval(func, sec):
-    def func_wrapper():
-        set_interval(func, sec)
-        func()
-    t = threading.Timer(sec, func_wrapper)
-    t.start()
-    return t
-
-
 def set_docstring(docstr, docstr_prefix=''):
     def wrap(func):
         func.__doc__ = docstr_prefix + docstr
@@ -102,6 +72,11 @@ class Verbosity(object):
     LOUD = "LOUD"
 
 
+def gen_batches(data, batch_size):
+    for i in range(len(data) // batch_size):
+        yield data[i*batch_size:(i+1)*batch_size]
+
+
 class FastmapConfig(object):
     """
     The configuration object. Do not instantiate this directly. Instead, use fastmap_init or
@@ -117,52 +92,68 @@ class FastmapConfig(object):
         self.all_local_cpus = all_local_cpus
         self._init_logging(verbosity)
 
-
         self.log.info("Setup fastmap")
         self.log.info(f" verbosity: {verbosity}.")
         self.log.info(f" exec_policy: {exec_policy}")
 
-        # formatter = logging.Formatter("%(asctime)s - %(message)s")
-        # self.log.setFormatter(formatter)
-
-        # self.log.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
         self.confirm_charges = confirm_charges
         self.cloud_url_base = "https://fastmap.io"
-
 
         # self.client = capnp.TwoPartyClient(Defaults.CLOUD_URL)
         # self.fastmap_wrapper = self.client.bootstrap().cast_as(fastmap_capnp.Fastmap)
 
-        # try:
-        #     self.num_threads = len(psutil.Process().cpu_affinity())
-        # except AttributeError:
-        #     self.num_threads = psutil.cpu_count()
-        self.num_threads = cpu_count()
+        try:
+            self.num_threads = len(psutil.Process().cpu_affinity())
+        except AttributeError:
+            self.num_threads = psutil.cpu_count()
+        # self.num_threads = cpu_count()
         if not self.all_local_cpus:
             self.num_threads -= 1
 
         if not confirm_charges and exec_policy != ExecPolicy.LOCAL:
-            self.log.warning("WARNING: Argument 'confirm_charges' is False. Your prepaid balance may be charged for usage without confirmation")
+            self.log.warning("WARNING: 'confirm_charges' is False. Your prepaid fastmap.io balance "
+                             "may be charged for usage without confirmation")
 
     @set_docstring(FASTMAP_DOCSTRING)
     def fastmap(self, func, data):
         data = list(data)
-        encoded_function = encode(func)
-        encoded_data = encode(data)
+        if not data:
+            return []
         self.log.info(f"Running fastmap on {func.__name__} with {len(data)} elements")
+
+        encoded_function = encode(func)
         self.log.info(f"Function payload {len(encoded_function):n} bytes")
+
+        f1 = None
+        ret = []
+        for batch in gen_batches(data, self.num_threads*10):
+            if not f1:
+                f1 = self._cloud_run(encoded_function, batch)
+                continue
+
+            if f1 and f1.done():
+                resp = f1.result()
+                if resp.status_code != 200:
+                    raise AssertionError("Error: %r" % resp.reason)
+                self.log.info("Responded in %.2f", resp.json()['elapsed_time'])
+                ret += decode(resp.json().get('result'))
+                f1 = self._cloud_run(encoded_function, batch)
+                continue
+            with Pool(self.num_threads) as pool:
+                ret += pool.map(func, batch)
+
+        return ret
+
+    def _cloud_run(self, encoded_function, data):
+        session = FuturesSession()
+        encoded_data = encode(data)
         self.log.info(f"Data payload {len(encoded_data):n} bytes")
         payload = {'func': encoded_function, 'data': encoded_data}
-        resp = requests.post(self.cloud_url_base + '/api/v1/execute', json=payload)
-        if resp.status_code != 200:
-            raise AssertionError("Error: %r" % resp.reason)
-        self.log.info("Responded in %.2f", resp.json()['elapsed_time'])
-        return decode(resp.json().get('result'))
+        return session.post(self.cloud_url_base + '/api/v1/execute', json=payload)
 
     def _init_logging(self, verbosity):
         self.log = logging.getLogger('fastmap')
 
-        ch = logging.StreamHandler()
         if verbosity == Verbosity.QUIET:
             self.log.setLevel(logging.CRITICAL)
         elif verbosity == Verbosity.NORMAL:
@@ -172,21 +163,10 @@ class FastmapConfig(object):
         else:
             raise AssertionError(f"Unknown value for verbosity '{verbosity}'")
 
-        # create formatter
+        ch = logging.StreamHandler()
         formatter = logging.Formatter('%(name)s: %(message)s')
-
-        # add formatter to ch
         ch.setFormatter(formatter)
-
-        # add ch to logger
         self.log.addHandler(ch)
-
-
-    # @staticmethod
-    # def _get_payload(func, data):
-
-
-        # return dill.loads(response.result.data)
 
 
     # def fastmap(self, func, iterable):
@@ -233,34 +213,13 @@ class FastmapConfig(object):
     #     self.log.info(f"item-transfer-time < local-execution-time ({avg_local_dur}s < {avg_transfer_dur}s). Executing on cloud and locally"),
 
 
-def _timed_func(func, *args):
-    t = timeit.Timer()
-    ret = func(*args)
-    return (t.timeit(), ret)
+# def _timed_func(func, *args):
+#     t = timeit.Timer()
+#     ret = func(*args)
+#     return (t.timeit(), ret)
 
 
-# class Compute(Thread):
-#     def __init__(self, request, func_hash):
-#         Thread.__init__(self)
-#         self.request = request
-#         self.func_hash = func_hash
-
-#     def run(self):
-#         sources = self.request.json['source']
-#         module_name = self.request.json['module_name']
-#         func_name = self.request.json['func_name']
-
-#         real_modules = {}
-#         for single_module_name, single_module_source in sources.items():
-#             single_module = imp.new_module(single_module_name)
-#             exec(single_module_source, single_module.__dict__)
-#             real_modules[single_module_name] = single_module
-
-#         func = real_modules[module_name].locals()[func_name]
-#         cache[self.func_hash] = func
-
-
-def _gen_hash(serialized_bytes):
-    sha = hashlib.sha256()
-    sha.update(serialized_bytes)
-    return sha.hexdigest()
+# def _gen_hash(serialized_bytes):
+#     sha = hashlib.sha256()
+#     sha.update(serialized_bytes)
+#     return sha.hexdigest()
