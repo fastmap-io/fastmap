@@ -5,7 +5,7 @@ from multiprocessing import Pool
 # import capnp
 # import fastmap_capnp
 import dill
-import psutil
+# import psutil
 from requests_futures.sessions import FuturesSession
 
 _transfer_durs = {}
@@ -102,11 +102,11 @@ class FastmapConfig(object):
         # self.client = capnp.TwoPartyClient(Defaults.CLOUD_URL)
         # self.fastmap_wrapper = self.client.bootstrap().cast_as(fastmap_capnp.Fastmap)
 
-        try:
-            self.num_threads = len(psutil.Process().cpu_affinity())
-        except AttributeError:
-            self.num_threads = psutil.cpu_count()
-        # self.num_threads = cpu_count()
+        # try:
+        #     self.num_threads = len(psutil.Process().cpu_affinity())
+        # except AttributeError:
+        #     self.num_threads = psutil.cpu_count()
+        self.num_threads = cpu_count()
         if not self.all_local_cpus:
             self.num_threads -= 1
 

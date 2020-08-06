@@ -1,10 +1,11 @@
-Fastmap is a distributed drop-in replacement for `map`. It runs faster than the builtin map function in almost all circumstances.
+Fastmap is a distributed drop-in replacement for `map`. It runs faster than the builtin map function in almost all cases. Fastmap is adaptively run both locally and the fastmap.io cloud service.
 
-- **Speed up your code**. Fastmap automatically parallelizes your code on the [fastmap.io](https://fastmap.io) cloud service. 
-- **Trivial to setup**. Get an [API token](https://fastmap.io/generate_api_toke), add `fastmap_global_init(...)` to the top of your file, and replace every instance of `map` with `fastmap`. There are no servers to provision or code to upload.
-- **Cheaper than you think**. We aim to charge the same to you as our infrastructure providers charge to us. See our [current prices](https://fastmap.io/prices). If our cloud service won't speed things up, fastmap will do all processing locally and you won't be charged.
+- **🏎 Speed up your code**. Fastmap automatically parallelizes your code. We utilize both your local machine and our cloud service. If the cloud won't speed things up, fastmap will do all processing locally and you won't be charged.
+- **🛎 Trivial to setup**. Get an [API token](https://fastmap.io/signup), add `fastmap_global_init(...)` to the top of your file, and replace every instance of `map` with `fastmap`. There are no servers to provision or code to upload.
+- **💸 Cheaper than you think**. We charge $0.05 per vCPU hour - comparable to AWS. On our service, $1 is enough to calculate 5 billion digits of pi. If our cloud service won't speed things up, fastmap will do all processing locally and you won't be charged.
+- **💀 Death promise**. We know you depend on us. If for any reason, we are no longer able to keep fastmap.io running, we will open-source everything.
 
-![Demo gif of fastmap. Text tutorial can be found below](demo.gif)
+![Demo gif of fastmap. Text tutorial can be found below](assets/demo.gif)
 
 Fastmap accelerates (often dramatically) the processing of data. Syntactically, it is all but equivalent to the builtin `map` function. Upon calling, fastmap calculates whether it would be faster to run map locally (in multiple threads) or upload most of the dataset for cloud processing. If no https://fastmap.io token is used, fastmap will run everything locally. You are only charged when running fastmap in the cloud. 
 

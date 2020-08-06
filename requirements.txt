@@ -1,3 +1,4 @@
-dill
-pycapnp
-psutil
+dill>0.3,<1.0
+# pycapnp
+# psutil>5.7,<6.0
+requests_futures
