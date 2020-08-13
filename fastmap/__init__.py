@@ -1,27 +1,25 @@
-import logging
-
-from .lib import (ExecPolicy, FastmapConfig, set_docstring,
-                  FASTMAP_DOCSTRING, FASTMAP_INIT_DOCSTRING)
+from .lib import (FastmapConfig, set_docstring,
+                  FASTMAP_DOCSTRING, INIT_DOCSTRING)
 
 _global_config = None
 
 
-@set_docstring(FASTMAP_INIT_DOCSTRING, "Initialize fastmap globally. Also see fastmap_init.")
-def fastmap_global_init(token, **kwargs):
+@set_docstring(INIT_DOCSTRING, "Initialize fastmap globally. Also see init.")
+def global_init(**kwargs):
     global _global_config
-    _global_config = fastmap_init(token, **kwargs)
+    _global_config = init(**kwargs)
 
 
-@set_docstring(FASTMAP_INIT_DOCSTRING, "Initialize a reusable FastmapConfig object. Also see fastmap_global_init.")
-def fastmap_init(token, **kwargs):
-    return FastmapConfig(token, **kwargs)
+@set_docstring(INIT_DOCSTRING, "Initialize a reusable FastmapConfig object. Also see global_init.")
+def init(**kwargs):
+    return FastmapConfig(**kwargs)
 
 
 @set_docstring(FASTMAP_DOCSTRING)
-def fastmap(func, iterable, **kwargs):
+def fastmap(func, iterable):
     if _global_config:
         _global_config.fastmap(func, iterable)
     else:
-        tmp_config = fastmap_init(exec_policy=ExecPolicy.LOCAL)
-        tmp_config.log.warning("You have not initialized fastmap with fastmap_global_init. All processing will be performed on this machine.")
+        tmp_config = init(secret=None, exec_policy='LOCAL')
+        tmp_config.log.warning("Try initializing fastmap with global_init first.")
         tmp_config.fastmap(func, iterable)

@@ -4,14 +4,14 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="pmap",
-    version="0.0.1",
-    author="pmap.io team",
-    author_email="contact@pmap.io",
-    description="Parallelize map via the pmap.io cloud service. Minimal-setup and no frameworks to learn",
+    name="fastmap",
+    version="0.1.0",
+    author="fastmap.io team",
+    author_email="contact@fastmap.io",
+    description="Fastmap is a distributed drop-in replacement for `map`. It runs faster than the builtin map function in most cases >1 second. Fastmap is adaptively run both locally and the fastmap.io cloud service.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/pmap/pmap",
+    url="https://github.com/fastmap-io/fastmap",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",

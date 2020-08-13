@@ -1,48 +1,44 @@
 import base64
 import logging
-from multiprocessing import Pool
+import os
+import multiprocessing
+import time
+import sys
+
 
 # import capnp
 # import fastmap_capnp
 import dill
 # import psutil
 from requests_futures.sessions import FuturesSession
+import requests
 
 _transfer_durs = {}
 dill.settings['recurse'] = True
 
 
 FASTMAP_DOCSTRING = """
-    Map a function over an iterable and return the mapped results.
+    Map a function over an iterable and return the results.
+
+    :param func: Function to map with. Must have no side effects.
+    :param iterable: Iterable to map over.
 
     Fastmap is a parallelized/distributed drop-in replacement for 'map'.
     It runs faster than the builtin map function in almost all circumstances.
-
-    Processing can occur locally via multithreading or on the cloud via the fastmap.io
-    service. Often, both the local and cloud environments will be utilized
-    simultaneously. If not explicitly specified, the division of work between the
-    local environment and the cloud will be determined automatically. If any processing
-    is performed on the cloud, charges will apply according to the current pricing.
-    For documentation on fastmap's cloud service, visit https://fastmap.io/cloud.
-
-    Configuration is possible by either:
-    - initializing configuration globally with fastmap_global_init
-    - initializing configuration for one reusable FastmapConfig object with fastmap_init
-
-    For more documentation on configuration, please refer to the docstring for fastmap_init.
-
-    Fastmap assumes that calls to the mapped function will be deterministic for
-    a given iterable element. As a result, processing may be done out-of-order.
+    For more documentation on fastmap, visit https://fastmap.io/
     """
 
-FASTMAP_INIT_DOCSTRING = """
-    Named parameters:
-    token: Available to be generated from fastmap.io/generate_token. If not included, fastmap will default to running locally
-    verbosity: One of 'QUIET', 'NORMAL', or 'LOUD'. Default is 'normal'.
-    exec_policy: Where to process the map. One of 'LOCAL', 'CLOUD', or 'ADAPTIVE' (default).
-    all_local_cpus: By default, fastmap will utilize n - 1 avaiable threads. This is to allow your computer to remain performant for other tasks while fastmap is running. Passing 'all_local_cpus = True' will make fastmap run faster at the cost of usability for other tasks.
-    confirm_charges: Before processing on the cloud, manually confirm cloud charges.
+INIT_DOCSTRING = """\n
+    :param secret: The API token generated on fastmap.io. Keep this secure and do not commit it to version control! If None, fastmap will run locally.
+    :param verbosity: One of 'QUIET', 'NORMAL', or 'LOUD'. Default is 'NORMAL'.
+    :param exec_policy: One of 'LOCAL', 'CLOUD', or 'ADAPTIVE'. Default is 'ADAPTIVE'.
+    :param all_local_cpus: By default, fastmap will utilize n - 1 available threads to allow other processes to remain performant. If set to True, fastmap will run marginally faster.
+    :param confirm_charges: Manually confirm cloud charges.
     """
+
+INITIAL_RUN_DUR = 1.0  # seconds
+BATCH_DUR = 5.0 # seconds
+PROCESS_OVERHEAD = 0.1  # seconds
 
 
 def set_docstring(docstr, docstr_prefix=''):
@@ -72,84 +68,302 @@ class Verbosity(object):
     LOUD = "LOUD"
 
 
-def gen_batches(data, batch_size):
-    for i in range(len(data) // batch_size):
-        yield data[i*batch_size:(i+1)*batch_size]
+from itertools import islice, chain
+
+# def gen_batches(iterable, size):
+#     sourceiter = iter(iterable)
+#     while True:
+#         batchiter = islice(sourceiter, size)
+#         yield chain([next(batchiter)], batchiter)
+
+def gen_batches(iterable, batch_size):
+    iterator = iter(iterable)
+    for first in iterator:
+        yield list(chain([first], islice(iterator, batch_size - 1)))
+
+# def gen_batches(iterable, batch_size):
+#     "grouper(3, 'ABCDEFG', 'x') --> ABC DEF Gxx"
+#     args = [iter(iterable)] * batch_size
+#     return zip(*args)
+
+# def gen_batches(data, batch_size):
+#     num_batches = (len(data) // batch_size)
+#     print("len(data)", len(data))
+#     print("batch_size", batch_size)
+#     print("num_batches", num_batches)
+#     for i in range(num_batches):
+#         # percent = (i / num_batches) * 100
+#         # sys.stdout.write('%s %.1f%%\r' % ('█' * int(percent / 2), percent))
+#         # sys.stdout.flush()
+#         yield data[i*batch_size:(i+1)*batch_size]
+#     # sys.stdout.write('%s %.1f%%\n' % ('█' * 50, 100))
+#     # sys.stdout.flush()
+
+
+def process_local(func, batches, results):
+    batch = batches.get()
+    while batch:
+        results.put(list(map(func, batch)))
+        batch = batches.get()
+
+
+class _RemoteProcessor(multiprocessing.Process):
+    def __init__(self, func, batches, results, parent):
+        multiprocessing.Process.__init__(self)
+        self.batches = batches
+        self.results = results
+        self.encoded_func = encode(func)
+        self.log = parent.log
+        # self.connections = []
+        self.cloud_url_base = parent.cloud_url_base
+        self.session = parent.session
+        # self.futures_session = FuturesSession()
+        self.log.info("Started remote processor. Function payload is %d bytes", len(self.encoded_func))
+
+    def run(self):
+        batch = self.batches.get()
+        while batch:
+            self._run_one(batch)
+            batch = self.batches.get()
+
+    def _run_one(self, batch):
+        payload = {'func': self.encoded_func, 'batch': encode(batch)}
+        # promise = self.futures_session.post(self.cloud_url_base + '/api/v1/execute', json=payload)
+        resp = self.session.post(self.cloud_url_base + '/api/v1/execute', json=payload)
+        if resp.status_code != 200:
+            self.log.error("Remote error %r", resp.text)
+        resp_json = resp.json()
+        if resp_json['status'] != "OK":
+            self.log.error("Status not OK %r", resp_json)
+        # print(resp_json)
+        self.results.put(decode(resp_json['results']))
+
+
+    # def run(self):
+    #     payload = {'func': self.encoded_func}
+
+    #     resp = self.futures_session.post(self.cloud_url_base + '/api/v1/init_map', json=payload).result()
+
+    #     if resp.status_code != 200:
+    #         self.log.error("Remote error %r", resp.text)
+
+    #     resp_json = resp.json()
+    #     if resp_json['status'] != "OK":
+    #         self.log.error("Status not OK %r", resp_json)
+
+    #     batch = self.batches.get()
+    #     while batch:
+    #         # TODO this is still sequential
+    #         resp = self.futures_session.post(self.cloud_url_base + '/api/v1/execute_data', json=payload).result()
+    #         resp_json = resp.json()
+    #         self.results.put(resp_json['results'])
 
 
 class FastmapConfig(object):
     """
-    The configuration object. Do not instantiate this directly. Instead, use fastmap_init or
-    fastmap_global_init.
+    The configuration object. Do not instantiate this directly.
+    Instead, either:
+    - use init to get a new FastmapConfig object
+    - use global_init to allow fastmap to run without an init object.
 
     This object exposes one public method: fastmap.
     """
 
-    def __init__(self, token=None, verbosity=Verbosity.NORMAL, exec_policy=ExecPolicy.ADAPTIVE,
-                 confirm_charges=False, all_local_cpus=False):
-        self.token = token
+    def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
+                 exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
+                 all_local_cpus=False):
         self.exec_policy = exec_policy
-        self.all_local_cpus = all_local_cpus
+        self._init_exec_policy(verbosity)
         self._init_logging(verbosity)
-
-        self.log.info("Setup fastmap")
-        self.log.info(f" verbosity: {verbosity}.")
-        self.log.info(f" exec_policy: {exec_policy}")
-
         self.confirm_charges = confirm_charges
-        self.cloud_url_base = "https://fastmap.io"
+        self.num_threads = os.cpu_count()
+        self.cloud_url_base = 'https://fastmap.io'
+        self.avg_local_run_time = None
 
-        # self.client = capnp.TwoPartyClient(Defaults.CLOUD_URL)
-        # self.fastmap_wrapper = self.client.bootstrap().cast_as(fastmap_capnp.Fastmap)
+        if secret:
+            self.session = requests.Session()
+            self.session.headers['Authorization'] = "Bearer " + secret
+        else:
+            self.session = None
+            self.exec_policy = "LOCAL"
+            self.log.warning("No secret provided. The exec_policy is now set to LOCAL")
 
         # try:
         #     self.num_threads = len(psutil.Process().cpu_affinity())
         # except AttributeError:
         #     self.num_threads = psutil.cpu_count()
-        self.num_threads = cpu_count()
-        if not self.all_local_cpus:
-            self.num_threads -= 1
+        if not all_local_cpus:
+            self.num_threads -= 2
 
         if not confirm_charges and exec_policy != ExecPolicy.LOCAL:
-            self.log.warning("WARNING: 'confirm_charges' is False. Your prepaid fastmap.io balance "
-                             "may be charged for usage without confirmation")
+            self.log.warning("The parameter 'confirm_charges' is False. Your vCPU-hour balance "
+                             "will be automatically debited if used")
+
+        self.log.info("Setup fastmap")
+        self.log.info(f" verbosity: {verbosity}.")
+        self.log.info(f" exec_policy: {exec_policy}")
+
+        # self.client = capnp.TwoPartyClient(Defaults.CLOUD_URL)
+        # self.fastmap_wrapper = self.client.bootstrap().cast_as(fastmap_capnp.Fastmap)
+
+    def get_processors(self, func):
+        batches = multiprocessing.Queue()
+        results = multiprocessing.Queue()
+
+        processors = []
+        if self.exec_policy != 'CLOUD':
+            for _ in range(self.num_threads):
+                local_process = multiprocessing.Process(target=process_local, args=(func, batches, results))
+                local_process.start()
+                processors.append(local_process)
+        if self.exec_policy != 'LOCAL':
+            remote_process = _RemoteProcessor(func, batches, results, self)
+            remote_process.start()
+            processors.append(remote_process)
+        return processors, batches, results
 
     @set_docstring(FASTMAP_DOCSTRING)
-    def fastmap(self, func, data):
-        data = list(data)
-        if not data:
-            return []
-        self.log.info(f"Running fastmap on {func.__name__} with {len(data)} elements")
-
-        encoded_function = encode(func)
-        self.log.info(f"Function payload {len(encoded_function):n} bytes")
-
-        f1 = None
-        ret = []
-        for batch in gen_batches(data, self.num_threads*10):
-            if not f1:
-                f1 = self._cloud_run(encoded_function, batch)
-                continue
-
-            if f1 and f1.done():
-                resp = f1.result()
-                if resp.status_code != 200:
-                    raise AssertionError("Error: %r" % resp.reason)
-                self.log.info("Responded in %.2f", resp.json()['elapsed_time'])
-                ret += decode(resp.json().get('result'))
-                f1 = self._cloud_run(encoded_function, batch)
-                continue
-            with Pool(self.num_threads) as pool:
-                ret += pool.map(func, batch)
+    def fastmap(self, func, iterable):
+        iterable = list(iterable)
+        orig_len = len(iterable)
+        start_time = time.perf_counter()
+        ret, avg_local_run_time = self._fastmap(func, iterable)
+        duration = time.perf_counter() - start_time
+        self.log.info("Duration: %.2f", duration)
+        if avg_local_run_time:
+            time_saved = avg_local_run_time * orig_len - duration
+            if time_saved > 60:
+                self.log.info("Fastmap processing done. You saved %.2f minutes", time_saved/60)
+            elif time_saved > 0:
+                self.log.info("Fastmap processing done. You saved %.2f seconds", time_saved)
+            else:
+                self.log.info("Fastmap processing done. You would have been better not using fastmap %.2f", time_saved)
 
         return ret
 
-    def _cloud_run(self, encoded_function, data):
-        session = FuturesSession()
-        encoded_data = encode(data)
-        self.log.info(f"Data payload {len(encoded_data):n} bytes")
-        payload = {'func': encoded_function, 'data': encoded_data}
-        return session.post(self.cloud_url_base + '/api/v1/execute', json=payload)
+    def _fastmap(self, func, iterable):
+        # start = time.perf_counter()
+        orig_len = len(iterable)
+        self.log.info(f"Running fastmap on {func.__name__} with {orig_len} elements")
+
+        if not iterable:
+            return [], None
+        # print("a", time.perf_counter() - start)
+
+        # pickled_func = dill.dumps(func)
+        # safe_func = dill.loads(pickled_func)
+
+        ret = []
+
+        if self.exec_policy == "CLOUD":
+            print("CLOUD")
+            batch_size = 3
+            avg_local_run_time = 0
+        else:
+            start_timing_loop = time.perf_counter()
+            while time.perf_counter() - start_timing_loop < INITIAL_RUN_DUR:
+                try:
+                    item = iterable.pop(0)
+                except IndexError:
+                    self.log.info(f"Fastmap finished faster than a loop")
+                    return ret, None
+                ret.append(func(item))
+            avg_local_run_time = (time.perf_counter() - start_timing_loop) / len(ret)
+
+            # print("b", time.perf_counter() - start)
+
+            estimated_run_time = avg_local_run_time * orig_len
+
+            if estimated_run_time < self.num_threads * PROCESS_OVERHEAD + estimated_run_time / self.num_threads:
+                self.log.info("Running single threaded")
+                return list(map(func, iterable)), avg_local_run_time
+
+            # print("c", time.perf_counter() - start)
+
+            batch_size = int(BATCH_DUR / avg_local_run_time)
+
+            if len(iterable) // self.num_threads < batch_size:
+                self.log.info("Running via map because it's not worth uploading")
+                with multiprocessing.Pool(self.num_threads) as pool:
+                    ret = pool.map(func, iterable)
+                    # print("d", time.perf_counter() - start)
+                    return ret, avg_local_run_time
+
+        processors, batches, results = self.get_processors(func)
+        print("processors", processors)
+        # be sure we are at least spreading it out equally amongst all processes
+        # TODO less than 5 seconds means run local maybe?
+        # batch_size = min((BATCH_DUR // self.avg_local_run_time,
+        #                   len(iterable) // self.num_threads))
+
+        in_cnt = 0
+        self.log.info("Batch size: %d/%d", batch_size, len(iterable))
+        for batch in gen_batches(iterable, batch_size):
+            print("batch", batch)
+            batches.put(batch)
+            in_cnt += 1
+
+        # poison pill
+        for _ in range(len(processors)):
+            batches.put(None)
+
+        out_cnt = 0
+        while out_cnt < in_cnt:
+            percent = (out_cnt / in_cnt) * 100
+            sys.stdout.write('%s %.1f%%\r' % ('█' * int(percent / 2), percent))
+            sys.stdout.flush()
+            ret += results.get()
+            out_cnt += 1
+        sys.stdout.write('%s %.1f%%\n' % ('█' * 50, 100))
+        sys.stdout.flush()
+
+        for p in processors:
+            p.join()
+
+        return ret, avg_local_run_time
+
+        # f1 = None
+        # ret = []
+        # for i, batch in enumerate(gen_batches(iterable, self.num_threads*10)):
+        #     if not f1:
+        #         f1 = self._cloud_run(encoded_function, batch)
+        #         print(f1, f1.__dict__)
+        #         continue
+
+        #     if f1.exception():
+        #         pass
+
+        #     if f1.done():
+        #         resp = f1.result()
+        #         if resp.status_code != 200:
+        #             raise AssertionError("Error: %r" % resp.reason)
+        #         # self.log.info("Responded in %.2f", resp.json()['elapsed_time'])
+        #         ret += decode(resp.json().get('result'))
+        #         f1 = self._cloud_run(encoded_function, batch)
+        #         continue
+        #     with Pool(self.num_threads) as pool:
+        #         ret += pool.map(func, batch)
+
+        # return ret
+
+    # def _cloud_run(self, encoded_function, data):
+    #     session = FuturesSession()
+    #     encoded_data = encode(data)
+    #     # self.log.info(f"Data payload {len(encoded_data):n} bytes")
+    #     payload = {'func': encoded_function, 'data': encoded_data}
+    #     return session.post(self.cloud_url_base + '/api/v1/execute', json=payload)
+
+    def _init_exec_policy(self, exec_policy):
+        pass  # TODO
+        # if exec_policy == "LOCAL":
+        #     self.runners = (_local_run,)
+        # elif exec_policy == "CLOUD":
+        #     self.runners = (_cloud_run,)
+        # elif exec_policy == "ADAPTIVE":
+        #     self.runners = (_local_run, _cloud_run)
+        # else:
+        #     raise AssertionError(f"Unknown value for exec_policy '{exec_policy}'")
+        # self.exec_policy = exec_policy
 
     def _init_logging(self, verbosity):
         self.log = logging.getLogger('fastmap')
@@ -162,12 +376,12 @@ class FastmapConfig(object):
             self.log.setLevel(logging.INFO)
         else:
             raise AssertionError(f"Unknown value for verbosity '{verbosity}'")
+        self.verbosity = verbosity
 
         ch = logging.StreamHandler()
         formatter = logging.Formatter('%(name)s: %(message)s')
         ch.setFormatter(formatter)
         self.log.addHandler(ch)
-
 
     # def fastmap(self, func, iterable):
     #     main_timer = timeit.Timer()
