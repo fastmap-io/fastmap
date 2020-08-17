@@ -75,6 +75,9 @@ def get_hash(obj):
     hasher.update(obj)
     return hasher.hexdigest()
 
+class BadCodeException(Exception):
+    pass
+
 
 class ExecPolicy(object):
     ADAPTIVE = "ADAPTIVE"
@@ -158,7 +161,7 @@ def process_local(func, itdm, log):
 
 
 def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
-                             thread_batches, main_batches, secret, log):
+                             itdm, secret, log):
 
     def logit(msg, *args):
         msg = msg % args
@@ -173,7 +176,7 @@ def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
     #     logit("Remote error %r" % pickle.loads(resp.content))
     # logit("In thread %d got resp to init_func %r" % (thread_id, resp.json()))
 
-    batch_tup = thread_batches.get()
+    batch_tup = itdm.checkout()
     req_dict = {
         'func': encoded_func,
         'func_hash': func_hash,
@@ -194,7 +197,6 @@ def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
         logit("Starting request with %d elements. %s. %.2fB / element ",
               len(batch_iter), fmt_bytes(len(payload)), len(payload) / len(batch_iter))
         start = time.perf_counter()
-        print(cloud_url_base + "/api/v1/execute")
         resp = requests.post(cloud_url_base + '/api/v1/execute',
                              data=payload, headers=additional_headers)
         req_time = time.perf_counter() - start
@@ -222,11 +224,11 @@ def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
         logit("Batch processed for %.2f/%.2f/%.2f map/app/req (%.2e/%.2e/%.2e per element)",
               total_processing, total_application, total_request, proc_time_per_el,
               app_time_per_el, req_time_per_el)
-        main_batches.push_outbox(batch_idx,
+        itdm.push_outbox(batch_idx,
                                  results,
                                  None
                                  )
-        batch_tup = thread_batches.get()
+        batch_tup = itdm.checkout()
 
 
 class _RemoteProcessor(multiprocessing.Process):
@@ -247,25 +249,19 @@ class _RemoteProcessor(multiprocessing.Process):
 
     def run(self):
         threads = []
-        thread_batches = multiprocessing.Queue(self.max_cloud_connections)
         self.log.debug("Opening %d remote connection(s)", self.max_cloud_connections)
         for thread_id in range(self.max_cloud_connections):
             self.log.debug("Creating remote thread %r", thread_id)
             thread_args = (thread_id, self.cloud_url_base, self.func_hash, self.encoded_func,
-                           thread_batches, self.itdm, self.secret, self.log)
+                           self.itdm, self.secret, self.log)
             thread = threading.Thread(target=remote_connection_thread, args=thread_args)
             thread.start()
             threads.append(thread)
 
-        batch = self.itdm.checkout()
-        while batch:
-            thread_batches.put(batch)
-            batch = self.itdm.checkout()
-
-        for _ in threads:
-            thread_batches.put(None)
         for thread in threads:
             thread.join()
+
+
 
 
 class InterThreadDataManager(object):
@@ -274,7 +270,7 @@ class InterThreadDataManager(object):
         manager = multiprocessing.Manager()
         self._lock = multiprocessing.Lock()
         self._inbox = manager.list()
-        self._outbox = multiprocessing.Queue()
+        self._outbox = manager.list()
         self._runtimes = manager.list()
         # self._loans = manager.dict()
 
@@ -309,14 +305,20 @@ class InterThreadDataManager(object):
                     return item_tup
 
     def push_outbox(self, item_idx, result, runtime):
-        self._outbox.put_nowait((item_idx, result))
         with self._lock:
+            self._outbox.append((item_idx, result))
             if runtime:
                 self._runtimes.append(runtime)
             # del self._loans[item_idx]
 
-    def pop_outbox(self):
-        return self._outbox.get()
+    def pop_outbox(self, processors):
+        while True:
+            with self._lock:
+                if len(self._outbox):
+                    return self._outbox.pop(0)
+            if not any(p.is_alive() for p in processors):
+                raise BadCodeException("Every process died. Check for errors in your code")
+            time.sleep(.01)
 
     def reprocess_loans(self):
         with self._lock:
@@ -358,7 +360,6 @@ class FastmapConfig(object):
         self.num_local_processes = os.cpu_count()
         self.cloud_url_base = 'https://fastmap.io'
         self.max_cloud_connections = 1
-        self.avg_runtime = None
 
         if secret:
             self.secret = secret
@@ -412,8 +413,8 @@ class FastmapConfig(object):
         network_duration = -1
 
         # self.log.info("Total : %.2f", total_duration)
-        if self.avg_runtime:
-            time_saved = self.avg_runtime * self.iterable_len - total_duration
+        if fastmapper.avg_runtime:
+            time_saved = fastmapper.avg_runtime * total_processed - total_duration
             if time_saved > 3600:
                 self.log.info("Processed %d elements in %.2fs. "
                               "You saved %.2f hours",
@@ -559,13 +560,14 @@ class _FastMapper(object):
         cur_idx = 0
         staging = {}
         while not itdm.state['inbox_done'] or cur_idx < batch_generator.num_batches_made():
-            result_idx, result_list = itdm.pop_outbox()
+            result_idx, result_list = itdm.pop_outbox(processors)
             staging[result_idx] = result_list
             while cur_idx in staging:
                 to_yield = staging.pop(cur_idx)
                 yield to_yield
                 total_yielded += len(to_yield)
                 cur_idx += 1
+
         fill_inbox_thread.join()
 
         for processor in processors:
