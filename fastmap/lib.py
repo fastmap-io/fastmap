@@ -225,8 +225,9 @@ def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
               total_processing, total_application, total_request, proc_time_per_el,
               app_time_per_el, req_time_per_el)
         itdm.push_outbox(batch_idx,
-                                 results,
-                                 None
+                         results,
+                         None,
+                         vcpu_seconds=total_application
                                  )
         batch_tup = itdm.checkout()
 
@@ -278,6 +279,7 @@ class InterThreadDataManager(object):
         self.state['inbox_done'] = False
         self.state['iterable_len'] = iterable_len
         self.state['max_inbox'] = max_inbox
+        self.state['total_vcpu_seconds'] = 0.0
 
     def mark_inbox_done(self):
         with self._lock:
@@ -304,11 +306,13 @@ class InterThreadDataManager(object):
                     # self._loans[item_tup[0]] = item_tup[1]
                     return item_tup
 
-    def push_outbox(self, item_idx, result, runtime):
+    def push_outbox(self, item_idx, result, runtime, vcpu_seconds=None):
         with self._lock:
             self._outbox.append((item_idx, result))
             if runtime:
                 self._runtimes.append(runtime)
+            if vcpu_seconds:
+                self.state['total_vcpu_seconds'] += vcpu_seconds
             # del self._loans[item_idx]
 
     def pop_outbox(self, processors):
@@ -357,7 +361,7 @@ class FastmapConfig(object):
         self._init_exec_policy(verbosity)
         self._init_logging(verbosity)
         self.confirm_charges = confirm_charges
-        self.num_local_processes = os.cpu_count()
+        self.num_local_threads = os.cpu_count()
         self.cloud_url_base = 'https://fastmap.io'
         self.max_cloud_connections = 1
 
@@ -369,11 +373,11 @@ class FastmapConfig(object):
             self.log.warning("No secret provided. The exec_policy is now set to LOCAL")
 
         # try:
-        #     self.num_local_processes = len(psutil.Process().cpu_affinity())
+        #     self.num_local_threads = len(psutil.Process().cpu_affinity())
         # except AttributeError:
-        #     self.num_local_processes = psutil.cpu_count()
+        #     self.num_local_threads = psutil.cpu_count()
         if not all_local_threads:
-            self.num_local_processes -= 1
+            self.num_local_threads -= 2
 
         if not confirm_charges and exec_policy != ExecPolicy.LOCAL:
             self.log.warning("The parameter 'confirm_charges' is False. Your vCPU-hour balance "
@@ -446,6 +450,9 @@ class FastmapConfig(object):
         else:
             self.log.info("Fastmap processing done.")
 
+        if fastmapper.total_vcpu_seconds:
+            self.log.debug("Used %.4f vCPU-hours.", fastmapper.total_vcpu_seconds/60/60)
+
     def _init_exec_policy(self, exec_policy):
         pass  # TODO
         # if exec_policy == "LOCAL":
@@ -484,24 +491,29 @@ class _FastMapper(object):
         self.iterable_len = None
         self.avg_runtime = None
 
+    def _estimated_runtime(self):
+        if self.avg_runtime and self.iterable_len:
+            return self.avg_runtime * self.iterable_len
+        return None
+
     def _get_processors(self, func):
         if self.config.exec_policy == 'CLOUD':
             max_batches_in_queue = self.config.max_cloud_connections  # TODO max connections needs to be smarter
         elif self.config.exec_policy == 'LOCAL':
-            max_batches_in_queue = self.config.num_local_processes
+            max_batches_in_queue = self.config.num_local_threads
         else:
-            max_batches_in_queue = self.config.num_local_processes + self.config.max_cloud_connections
+            max_batches_in_queue = self.config.num_local_threads + self.config.max_cloud_connections
 
         itdm = InterThreadDataManager(self.iterable_len, max_batches_in_queue)
 
         processors = []
         if self.config.exec_policy != 'CLOUD':
-            for _ in range(self.config.num_local_processes):
+            for _ in range(self.config.num_local_threads):
                 process_args = (func, itdm, self.log)
                 local_process = multiprocessing.Process(target=process_local, args=process_args)
                 local_process.start()
                 processors.append(local_process)
-            self.log.debug("Launching %d local processes", self.config.num_local_processes)
+            self.log.debug("Launching %d local processes", self.config.num_local_threads)
         if self.config.exec_policy != 'LOCAL':
             remote_process = _RemoteProcessor(func, itdm, self.config)
             remote_process.start()
@@ -538,15 +550,15 @@ class _FastMapper(object):
         total_yielded = len(ret)
         yield ret
 
-        # if hasattr(iterable, "__len__"):
-        #     estimated_run_time = self.avg_runtime * self.iterable_len
-        #     if estimated_run_time < self.config.num_local_processes * PROCESS_OVERHEAD + estimated_run_time / self.config.num_local_processes:
-        #         self.log.info("Running single threaded")
-        #         yield map(func, iterable)
-        #         return
-
+        # if self.iterable_len:
+        #     total_process_overhead = self.config.num_local_threads * PROCESS_OVERHEAD
+        #     total_process_time_estimate = self.estimated_run_time() / self.config.num_local_threads
+        #     if self.estimated_run_time() > total_process_overhead + total_process_time_estimate:
+        #         iterable = list(iterable)                
+        #         yield list(map(func, iterable))
+                
         #     if estimated_run_time < CLOUD_OVERHEAD:
-        #         with multiprocessing.Pool(self.config.num_local_processes) as pool:
+        #         with multiprocessing.Pool(self.config.num_local_threads) as pool:
         #             yield pool.map(func, iterable)
         #         return
 
@@ -574,4 +586,5 @@ class _FastMapper(object):
             processor.join()
 
         self.avg_runtime = batch_generator.total_avg_runtime()
+        self.total_vcpu_seconds = itdm.state['total_vcpu_seconds']
         self.iterable_len = batch_generator.element_cnt
