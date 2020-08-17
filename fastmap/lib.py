@@ -159,6 +159,14 @@ def process_local(func, itdm, log):
         itdm.push_outbox(batch_idx, ret, runtime)
         batch_tup = itdm.checkout()
 
+def _fastrun_local(queue, func, args, kwargs):
+    queue.put(func(*args, **kwargs))
+
+def get_additional_headers(secret):
+    return {
+        'Authorization': 'Bearer ' + secret,
+        'content-encoding': 'gzip'
+    }
 
 def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
                              itdm, secret, log):
@@ -177,14 +185,12 @@ def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
     # logit("In thread %d got resp to init_func %r" % (thread_id, resp.json()))
 
     batch_tup = itdm.checkout()
+    additional_headers = get_additional_headers(secret)
     req_dict = {
         'func': encoded_func,
         'func_hash': func_hash,
     }
-    additional_headers = {
-        'Authorization': 'Bearer ' + secret,
-        'content-encoding': 'gzip'
-    }
+
 
     while batch_tup:
         batch_idx, batch_iter = batch_tup
@@ -344,6 +350,7 @@ def fill_inbox(batch_generator, itdm):
     itdm.mark_inbox_done()
 
 
+
 class FastmapConfig(object):
     """
     The configuration object. Do not instantiate this directly.
@@ -452,6 +459,39 @@ class FastmapConfig(object):
 
         if fastmapper.total_vcpu_seconds:
             self.log.debug("Used %.4f vCPU-hours.", fastmapper.total_vcpu_seconds/60/60)
+
+    def fastrun(self, func, *args, **kwargs):
+        start_time = time.perf_counter()
+        if self.exec_policy == "LOCAL":
+            queue = multiprocessing.Queue()
+            proc = multiprocessing.Process(_fastrun_local, (queue, func, args, kwargs))
+            proc.start()
+            proc.join()
+            results = queue.get()
+            runtime = time.perf_counter() - start_time
+            self.log.info("Fastrun processing done in %.2f.", runtime)
+            return results
+
+        req_dict = {
+            "func": dill.dumps(func),
+            "args": args,
+            "kwargs": kwargs
+            }
+        pickled = pickle.dumps(req_dict)
+        encoded = base64.b64encode(pickled)
+        payload = gzip.compress(encoded, compresslevel=1)
+
+        resp = requests.post(self.cloud_url_base + "/api/v1/run", data=payload, 
+                             headers=get_additional_headers(self.secret))
+        resp_dict = pickle.loads(resp.content)
+        if resp.status_code != 200:
+            raise BadCodeException("Remote error %r" % resp_dict)
+
+        runtime = time.perf_counter() - start_time
+        self.log.info("Fastrun processing done in %.2f.", runtime)
+        self.log.debug("Used %.4f vCPU-hours", resp.headers['vcpu_seconds']/60/60)
+        return resp_dict['result']
+ 
 
     def _init_exec_policy(self, exec_policy):
         pass  # TODO
