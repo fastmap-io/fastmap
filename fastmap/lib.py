@@ -30,10 +30,10 @@ FASTMAP_DOCSTRING = """
     """
 
 INIT_DOCSTRING = """\n
-    :param secret: The API token generated on fastmap.io. Keep this secure and do not commit it to version control! If None, fastmap will run locally.
+    :param secret: The API token generated on fastmap.io. Treat this like a password. Do not commit it to version control! If None, fastmap will run locally.
     :param verbosity: One of 'QUIET', 'NORMAL', or 'LOUD'. Default is 'NORMAL'.
     :param exec_policy: One of 'LOCAL', 'CLOUD', or 'ADAPTIVE'. Default is 'ADAPTIVE'.
-    :param all_local_cpus: By default, fastmap will utilize n - 1 available threads to allow other processes to remain performant. If set to True, fastmap may run marginally faster.
+    :param all_local_threads: By default, fastmap will utilize n - 1 available threads to allow other processes to remain performant. If set to True, fastmap may run marginally faster.
     :param confirm_charges: Manually confirm cloud charges.
     """
 
@@ -187,8 +187,9 @@ def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
         batch_idx, batch_iter = batch_tup
         start = time.perf_counter()
         req_dict['batch'] = batch_iter
-        payload = pickle.dumps(req_dict)
-        payload = gzip.compress(payload, compresslevel=1)
+        pickled = pickle.dumps(req_dict)
+        encoded = base64.b64encode(pickled)
+        payload = gzip.compress(encoded, compresslevel=1)
         encoding_time = time.perf_counter() - start
         logit("Starting request with %d elements. %s. %.2fB / element ",
               len(batch_iter), fmt_bytes(len(payload)), len(payload) / len(batch_iter))
@@ -202,20 +203,16 @@ def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
             break
 
         start = time.perf_counter()
-        resp_dict = pickle.loads(resp.content)
+        resp_dict = pickle.loads(base64.b64decode(resp.content))
         redecoding_time = time.perf_counter() - start
 
         results = resp_dict['results']
-        remote_cid = resp_dict['container_id']
-        remote_tid = resp_dict['thread_id']
-        if resp_dict['status'] != "OK":
-            log.warning("Status not OK %r", resp_dict)
-            break
-        # results = pickle.loads(resp_json['results'])
+        remote_cid = resp.headers['X-Container-Id']
+        remote_tid = resp.headers['X-Thread-Id']
 
         total_request = encoding_time + req_time + redecoding_time
-        total_application = float(resp.headers['X-App-Duration'])
-        total_processing = resp_dict['vcpu_seconds']
+        total_application = float(resp.headers['X-Total-Seconds'])
+        total_processing = resp_dict['map_seconds']
         req_time_per_el = total_request / len(results)
         app_time_per_el = total_application / len(results)
         proc_time_per_el = total_processing / len(results)
@@ -240,7 +237,7 @@ class _RemoteProcessor(multiprocessing.Process):
 
         pickled_func = dill.dumps(func)
         self.func_hash = get_hash(pickled_func)
-        self.encoded_func = base64.b64encode(pickled_func).decode()
+        self.encoded_func = pickled_func
 
         self.log = parent.log
         self.max_cloud_connections = parent.max_cloud_connections
@@ -253,7 +250,7 @@ class _RemoteProcessor(multiprocessing.Process):
         thread_batches = multiprocessing.Queue(self.max_cloud_connections)
         self.log.debug("Opening %d remote connection(s)", self.max_cloud_connections)
         for thread_id in range(self.max_cloud_connections):
-            self.log.debug("Creating remote thread", thread_id)
+            self.log.debug("Creating remote thread %r", thread_id)
             thread_args = (thread_id, self.cloud_url_base, self.func_hash, self.encoded_func,
                            thread_batches, self.itdm, self.secret, self.log)
             thread = threading.Thread(target=remote_connection_thread, args=thread_args)
@@ -279,7 +276,7 @@ class InterThreadDataManager(object):
         self._inbox = manager.list()
         self._outbox = multiprocessing.Queue()
         self._runtimes = manager.list()
-        self._loans = manager.dict()
+        # self._loans = manager.dict()
 
         self.state = manager.dict()
         self.state['inbox_done'] = False
@@ -308,7 +305,7 @@ class InterThreadDataManager(object):
                     return None
                 if self._inbox:
                     item_tup = self._inbox.pop(0)
-                    self._loans[item_tup[0]] = item_tup[1]
+                    # self._loans[item_tup[0]] = item_tup[1]
                     return item_tup
 
     def push_outbox(self, item_idx, result, runtime):
@@ -316,7 +313,7 @@ class InterThreadDataManager(object):
         with self._lock:
             if runtime:
                 self._runtimes.append(runtime)
-            del self._loans[item_idx]
+            # del self._loans[item_idx]
 
     def pop_outbox(self):
         return self._outbox.get()
@@ -324,7 +321,7 @@ class InterThreadDataManager(object):
     def reprocess_loans(self):
         with self._lock:
             self._inbox = sorted(self._loans.items()) + self._inbox
-            self._loans = {}
+            # self._loans = {}
 
 
 def fill_inbox(batch_generator, itdm):
@@ -353,7 +350,7 @@ class FastmapConfig(object):
 
     def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
                  exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
-                 all_local_cpus=False):
+                 all_local_threads=False):
         self.exec_policy = exec_policy
         self._init_exec_policy(verbosity)
         self._init_logging(verbosity)
@@ -374,7 +371,7 @@ class FastmapConfig(object):
         #     self.num_local_processes = len(psutil.Process().cpu_affinity())
         # except AttributeError:
         #     self.num_local_processes = psutil.cpu_count()
-        if not all_local_cpus:
+        if not all_local_threads:
             self.num_local_processes -= 1
 
         if not confirm_charges and exec_policy != ExecPolicy.LOCAL:
