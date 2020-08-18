@@ -1,13 +1,19 @@
-Fastmap is a distributed drop-in replacement for `map`. It runs faster than the builtin map function in almost all cases. Fastmap is adaptively run both locally and the fastmap.io cloud service.
+> Note: Fastmap is currently in alpha and new fastmap.io accounts are invite-only. Alpha software often has bugs and service disruptions. While unintended, expect both until fastmap graduates to beta. If you are reading this, you are the salt-of-the-earth and I could use your help working out the kinks. Email me for a token!
+
+![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-red)
+
+### Zero setup distributed computing
+
+Fastmap is a drop-in replacement for `map` that makes your code run faster. It accomplishes this by utilizing both our cloud services and your local machine. Fastmap runs faster than map in almost all circumstances.
 
 ![Demo gif of fastmap. Text tutorial can be found below](assets/demo.gif)
 
-- **🚀 Speed up your code**. Fastmap automatically parallelizes your code. We utilize both your local machine and our cloud service. If the cloud won't speed things up, fastmap will do all processing locally and you won't be charged.
-- **🐣 Trivial to setup**. Get an [API token](https://fastmap.io/), add `global_init(...)` to the top of your file, and replace every instance of `map` with `fastmap`. There are no servers to provision or code to upload.
-- **💵 Cheaper than you think**. We charge $0.05 per vCPU hour - comparable to AWS. On our service, $1 is enough to calculate 5 billion digits of pi.
+- **🚀 Speed up your code**. Fastmap automatically parallelizes your code. We utilize both our cloud service and your local machine. If the cloud won't speed things up, fastmap will do all processing locally and you won't be charged.
+- **🐣 Trivial to setup**. Get an [API token](https://fastmap.io/) and replace every instance of `map` with `fastmap`. There are no servers to provision or code to upload.
+- **💵 Cheaper than you think**. When you signup, you get 10 vCPU-hours for free. That's enough to calculate >5 billion primes. After that, we charge $10 for 200 vCPU-hours or $90 for 2000.
 - **🧟‍♂️ Continuity promise**. We know you depend on us. If for any reason, we are no longer able to keep fastmap.io running, we will open-source everything.
 
-Fastmap accelerates (often dramatically) the processing of data. Syntactically, it is all but equivalent to the builtin `map` function. Upon calling, fastmap calculates whether it would be faster to run map locally (in multiple threads) or upload most of the dataset for cloud processing. If no https://fastmap.io api token is used, fastmap will run everything locally. You are only charged when running fastmap in the cloud. 
+Fastmap accelerates (often dramatically) the processing of data. Syntactically, it is all but equivalent to the builtin `map` function. Upon calling, fastmap calculates whether it would be faster to run map locally (in multiple processes) or upload most of the dataset for cloud processing. If no https://fastmap.io api token is used, fastmap will run everything locally. You are only charged when running fastmap in the cloud.
 
 ### Docs
 
@@ -28,7 +34,7 @@ Note that in some environments, you may need to use `sudo` and/or `pip3`
 import csv
 from fastmap import global_init, fastmap
 from my_project import big_function
-from config import FASTMAP_TOKEN  
+from config import FASTMAP_TOKEN
 
 # Important: Protect your API token like a password and never commit it to version control
 global_init(secret=FASTMAP_TOKEN)
@@ -43,7 +49,7 @@ results = fastmap(big_function, long_list)
 
 ### When should you use fastmap?
 
-Use fastmap whenever you have a stateless function that needs to process many elements. Most calls to `map` will already fit this criteria. 
+Use fastmap whenever you have a function that needs to process many elements. The function must be a "[pure function](https://en.wikipedia.org/wiki/Pure_function)" meaning that it doesn't depend on state and has no side effects (like making network calls or altering state). Many calls to `map` will already fit this criteria.
 
 
 ### Tips for specific use cases
@@ -60,11 +66,11 @@ No problem! You can still run fastmap without a fastmap.io account. Instead of p
 
 ### Limitations
 
-1. Fastmap.io is a prepaid service. You must have credits in your fastmap.io account to take advantage of the cloud functionality
-2. Network calls are not supported. For security, we run your code in a sandbox. You cannot make calls to outside services.
-3. Fastmap only works on code that is not stateful. Most calls to mao.
+1. Fastmap.io is a prepaid service. You must have credits in your fastmap.io account to take advantage of the cloud functionality.
+2. Network calls are not supported. For security, we run your code in a sandbox.
+3. Fastmap only works on code without
 
 
 ### Questions
 
-Fastmap.io is a new project and we would love to hear your feedback. 
+Fastmap.io is a new project and we would love to hear your feedback. You can contact the CEO directly at scott@fastmap.io.

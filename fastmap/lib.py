@@ -9,7 +9,6 @@ import sys
 import threading
 import time
 
-
 import dill
 # import psutil
 import requests
@@ -20,13 +19,28 @@ dill.settings['recurse'] = True
 
 FASTMAP_DOCSTRING = """
     Map a function over an iterable and return the results.
+    Depending on prior configuration, fastmap will run either locally via multiprocessing,
+    in the cloud on the fastmap.io servers, or adaptively on both.
 
-    :param func: Function to map with. Must have no side effects.
+    :param func: Function to map with. Must be a "pure function" with no side effects.
     :param iterable: Iterable to map over.
 
     Fastmap is a parallelized/distributed drop-in replacement for 'map'.
     It runs faster than the builtin map function in most circumstances.
     For more documentation on fastmap, visit https://fastmap.io/docs
+    """
+
+FASTRUN_DOCSTRING = """
+    Start a function and returns a Promise object.
+    Depending on prior configuration, fastmap will run either locally via a separate process,
+    in the cloud on the fastmap.io servers, or adaptively on both.
+
+    :param func: Function to run. Must be a "pure function" with no side effects.
+    :param *args: Positional arguments for the function.
+    :param **kwargs: Keyword arguments for the function.
+
+    Fastrun is a method for offloading function execution either in the cloud or on a separate process.
+    For more documentation on fastrun, visit https://fastmap.io/docs
     """
 
 INIT_DOCSTRING = """\n
@@ -75,23 +89,31 @@ def get_hash(obj):
     hasher.update(obj)
     return hasher.hexdigest()
 
-class BadCodeException(Exception):
-    pass
+
+class ExecutionException(Exception):
+    """
+    Thrown when something goes wrong running the user's code on the
+    cloud or on separate processes.
+    """
 
 
-class ExecPolicy(object):
+class ExecPolicy():
     ADAPTIVE = "ADAPTIVE"
     LOCAL = "LOCAL"
     CLOUD = "CLOUD"
 
 
-class Verbosity(object):
+class Verbosity():
     QUIET = "QUIET"
     NORMAL = "NORMAL"
     LOUD = "LOUD"
 
 
-class BatchGenerator(object):
+class Promise():
+    pass
+
+
+class BatchGenerator():
     """
     Takes an iterable and smartly turns it into batches of the correct size
     """
@@ -159,14 +181,17 @@ def process_local(func, itdm, log):
         itdm.push_outbox(batch_idx, ret, runtime)
         batch_tup = itdm.checkout()
 
+
 def _fastrun_local(queue, func, args, kwargs):
     queue.put(func(*args, **kwargs))
+
 
 def get_additional_headers(secret):
     return {
         'Authorization': 'Bearer ' + secret,
         'content-encoding': 'gzip'
     }
+
 
 def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
                              itdm, secret, log):
@@ -233,8 +258,7 @@ def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
         itdm.push_outbox(batch_idx,
                          results,
                          None,
-                         vcpu_seconds=total_application
-                                 )
+                         vcpu_seconds=total_application)
         batch_tup = itdm.checkout()
 
 
@@ -269,9 +293,7 @@ class _RemoteProcessor(multiprocessing.Process):
             thread.join()
 
 
-
-
-class InterThreadDataManager(object):
+class InterThreadDataManager():
 
     def __init__(self, iterable_len=None, max_inbox=None):
         manager = multiprocessing.Manager()
@@ -327,7 +349,7 @@ class InterThreadDataManager(object):
                 if len(self._outbox):
                     return self._outbox.pop(0)
             if not any(p.is_alive() for p in processors):
-                raise BadCodeException("Every process died. Check for errors in your code")
+                raise ExecutionException("Every process died. Check for errors in your code")
             time.sleep(.01)
 
     def reprocess_loans(self):
@@ -350,8 +372,7 @@ def fill_inbox(batch_generator, itdm):
     itdm.mark_inbox_done()
 
 
-
-class FastmapConfig(object):
+class FastmapConfig():
     """
     The configuration object. Do not instantiate this directly.
     Instead, either:
@@ -391,8 +412,8 @@ class FastmapConfig(object):
                              "will be automatically debited for use.")
 
         self.log.debug("Setup fastmap")
-        self.log.debug(f" verbosity: {verbosity}.")
-        self.log.debug(f" exec_policy: {exec_policy}")
+        self.log.debug(" verbosity: %s.", verbosity)
+        self.log.debug(" exec_policy: %s", exec_policy)
 
     @set_docstring(FASTMAP_DOCSTRING)
     def fastmap(self, func, iterable):
@@ -402,7 +423,7 @@ class FastmapConfig(object):
         if hasattr(iterable, '__len__'):
             total_unprocessed = len(iterable)
             total_processed = 0
-            for batch in fastmapper._fastmap(func, iterable):
+            for batch in fastmapper.fastmap(func, iterable):
                 for el in batch:
                     yield el
                 total_processed += len(batch)
@@ -413,7 +434,7 @@ class FastmapConfig(object):
             print()
         else:
             total_processed = 0
-            for batch in fastmapper._fastmap(func, iterable):
+            for batch in fastmapper.fastmap(func, iterable):
                 for el in batch:
                     yield el
                 total_processed += len(batch)
@@ -423,7 +444,6 @@ class FastmapConfig(object):
         total_duration = time.perf_counter() - start_time
         network_duration = -1
 
-        # self.log.info("Total : %.2f", total_duration)
         if fastmapper.avg_runtime:
             time_saved = fastmapper.avg_runtime * total_processed - total_duration
             if time_saved > 3600:
@@ -460,6 +480,7 @@ class FastmapConfig(object):
         if fastmapper.total_vcpu_seconds:
             self.log.debug("Used %.4f vCPU-hours.", fastmapper.total_vcpu_seconds/60/60)
 
+    @set_docstring(FASTRUN_DOCSTRING)
     def fastrun(self, func, *args, **kwargs):
         start_time = time.perf_counter()
         if self.exec_policy == "LOCAL":
@@ -481,17 +502,17 @@ class FastmapConfig(object):
         encoded = base64.b64encode(pickled)
         payload = gzip.compress(encoded, compresslevel=1)
 
-        resp = requests.post(self.cloud_url_base + "/api/v1/run", data=payload, 
+        resp = requests.post(self.cloud_url_base + "/api/v1/run", data=payload,
                              headers=get_additional_headers(self.secret))
         resp_dict = pickle.loads(resp.content)
         if resp.status_code != 200:
-            raise BadCodeException("Remote error %r" % resp_dict)
+            raise ExecutionException("Remote error %r" % resp_dict)
 
         runtime = time.perf_counter() - start_time
         self.log.info("Fastrun processing done in %.2f.", runtime)
         self.log.debug("Used %.4f vCPU-hours", resp.headers['vcpu_seconds']/60/60)
         return resp_dict['result']
- 
+
 
     def _init_exec_policy(self, exec_policy):
         pass  # TODO
@@ -524,7 +545,11 @@ class FastmapConfig(object):
         self.log.addHandler(ch)
 
 
-class _FastMapper(object):
+class _FastMapper():
+    """
+    Wrapper for running fastmap. Maintains state variables including
+    iterable_len and avg_runtime.
+    """
     def __init__(self, config):
         self.config = config
         self.log = config.log
@@ -538,7 +563,7 @@ class _FastMapper(object):
 
     def _get_processors(self, func):
         if self.config.exec_policy == 'CLOUD':
-            max_batches_in_queue = self.config.max_cloud_connections  # TODO max connections needs to be smarter
+            max_batches_in_queue = self.config.max_cloud_connections  # TODO make this smarter
         elif self.config.exec_policy == 'LOCAL':
             max_batches_in_queue = self.config.num_local_threads
         else:
@@ -560,10 +585,7 @@ class _FastMapper(object):
             processors.append(remote_process)
         return processors, itdm
 
-    def _fastmap(self, func, iterable):
-        # start = time.perf_counter()
-
-        # orig_len = len(iterable)
+    def fastmap(self, func, iterable):
         self.log.debug(f"Running fastmap on {func.__name__}")
 
         self.avg_runtime = None
@@ -594,9 +616,9 @@ class _FastMapper(object):
         #     total_process_overhead = self.config.num_local_threads * PROCESS_OVERHEAD
         #     total_process_time_estimate = self.estimated_run_time() / self.config.num_local_threads
         #     if self.estimated_run_time() > total_process_overhead + total_process_time_estimate:
-        #         iterable = list(iterable)                
+        #         iterable = list(iterable)
         #         yield list(map(func, iterable))
-                
+
         #     if estimated_run_time < CLOUD_OVERHEAD:
         #         with multiprocessing.Pool(self.config.num_local_threads) as pool:
         #             yield pool.map(func, iterable)
