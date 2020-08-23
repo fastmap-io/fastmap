@@ -1,7 +1,8 @@
+import atexit
 import base64
 import gzip
 import hashlib
-import logging
+import itertools
 import multiprocessing
 import os
 import pickle
@@ -73,7 +74,7 @@ def fmt_bytes(num_bytes):
         return "%.2fMB" % (num_bytes / 1024**2)
     if num_bytes > 1024:
         return "%.2fKB" % (num_bytes / 1024)
-    return "%dB"
+    return "%dB" % num_bytes
 
 
 def encode(raw_data):
@@ -96,6 +97,10 @@ class ExecutionException(Exception):
     cloud or on separate processes.
     """
 
+class RemoteError(Exception):
+    """
+    Thrown when the remote connection results in a non-200
+    """
 
 class ExecPolicy():
     ADAPTIVE = "ADAPTIVE"
@@ -109,182 +114,154 @@ class Verbosity():
     LOUD = "LOUD"
 
 
-class Promise():
-    pass
-
-
-class BatchGenerator():
-    """
-    Takes an iterable and smartly turns it into batches of the correct size
-    """
-    def __init__(self, iterable, initial_runtime=None, batch_goal_time=1.0):
-        self.iterable_len = -1
-        self.iterable = iter(iterable)
-        self.runtimes = []
-        self.batch_goal_time = batch_goal_time
-        self.batch_idx = -1
-        self.element_cnt = 0
-        if initial_runtime:
-            self.runtimes.append(initial_runtime)
-
-    def running_avg_runtime(self):
-        try:
-            return sum(self.runtimes[-5:]) / len(self.runtimes[-5:])
-        except ZeroDivisionError:
-            return self.batch_goal_time
-
-    def total_avg_runtime(self):
-        try:
-            return sum(self.runtimes) / len(self.runtimes)
-        except ZeroDivisionError:
-            return None
-
-    def num_batches_made(self):
-        return self.batch_idx + 1
-
-    def next(self, last_runtime=None):
-        if last_runtime:
-            self.runtimes.append(last_runtime)
-        batch_size = int(self.batch_goal_time / self.running_avg_runtime())
-        batch_seq = []
-        for _ in range(batch_size):
-            try:
-                batch_seq.append(next(self.iterable))
-            except StopIteration:
-                break
-        if not batch_seq:
-            return None
-        self.batch_idx += 1
-        self.element_cnt += len(batch_seq)
-        # sys.stdout.write("Generated batch %d. Elements in batch:%d Elements so far:%d\r" %
-        #                  (self.batch_idx, len(batch_seq), self.element_cnt))
-        # sys.stdout.flush()
-        return self.batch_idx, batch_seq
-
-
-def process_local(func, itdm, log):
-
-    def logit(msg, *args):
-        msg = msg % args
-        if log.level <= 10:
-            print("fastmap: " + msg)
-
-    batch_tup = itdm.checkout()
-    while batch_tup:
-        batch_idx, batch_iter = batch_tup
-        start = time.perf_counter()
-        ret = list(map(func, batch_iter))
-        total_proc_time = time.perf_counter() - start
-        runtime = total_proc_time / len(ret)
-        logit("Batch %d of size %d ran in %.2f (%.2e per element)",
-              batch_idx, len(ret), total_proc_time, runtime)
-        itdm.push_outbox(batch_idx, ret, runtime)
+def process_local(func, itdm, log, error_queue):
+    try:
         batch_tup = itdm.checkout()
+        while batch_tup:
+            batch_idx, batch_iter = batch_tup
+            start = time.perf_counter()
+            ret = list(map(func, batch_iter))
+            total_proc_time = time.perf_counter() - start
+            runtime = total_proc_time / len(ret)
+            log.debug("Batch %d of size %d ran in %.2f (%.2e per element)",
+                      batch_idx, len(ret), total_proc_time, runtime)
+            itdm.push_outbox(batch_idx, ret, runtime)
+            batch_tup = itdm.checkout()
+    except Exception as e:
+        error_queue.put((multiprocessing.current_process().name, repr(e)))
 
 
 def _fastrun_local(queue, func, args, kwargs):
     queue.put(func(*args, **kwargs))
 
 
-def get_additional_headers(secret):
+def get_headers(secret):
+    """Get headers for communicating with the fastmap.io cloud service"""
     return {
         'Authorization': 'Bearer ' + secret,
-        'content-encoding': 'gzip'
+        'Content-Encoding': 'gzip',
+        'X-Python-Version': sys.version.replace('\n', ''),
     }
 
 
-def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
-                             itdm, secret, log):
-
-    def logit(msg, *args):
-        msg = msg % args
-        if log.level <= 10:
-            print("fastmap: " + msg)
-
-    # session = requests.Session()
-    # session.headers['Authorization'] = "Bearer " + secret
-
-    # resp = session.post(cloud_url_base + '/api/v1/init_map', json={'func': encoded_func})
-    # if resp.status_code != 200:
-    #     logit("Remote error %r" % pickle.loads(resp.content))
-    # logit("In thread %d got resp to init_func %r" % (thread_id, resp.json()))
-
-    batch_tup = itdm.checkout()
-    additional_headers = get_additional_headers(secret)
-    req_dict = {
-        'func': encoded_func,
-        'func_hash': func_hash,
-    }
 
 
-    while batch_tup:
-        batch_idx, batch_iter = batch_tup
-        start = time.perf_counter()
-        req_dict['batch'] = batch_iter
-        pickled = pickle.dumps(req_dict)
-        encoded = base64.b64encode(pickled)
-        payload = gzip.compress(encoded, compresslevel=1)
-        encoding_time = time.perf_counter() - start
-        logit("Starting request with %d elements. %s. %.2fB / element ",
-              len(batch_iter), fmt_bytes(len(payload)), len(payload) / len(batch_iter))
-        start = time.perf_counter()
-        resp = requests.post(cloud_url_base + '/api/v1/execute',
-                             data=payload, headers=additional_headers)
-        req_time = time.perf_counter() - start
-        if resp.status_code != 200:
-            log.warning("Remote error %r" % pickle.loads(resp.content))
-            break
+def process_one_batch_remotely(itdm, batch_tup, url, req_dict, headers, log):
+    start_req_time = time.perf_counter()
 
-        start = time.perf_counter()
+    batch_idx, batch = batch_tup
+    req_dict['batch'] = batch
+    pickled = pickle.dumps(req_dict)
+    encoded = base64.b64encode(pickled)
+    payload = gzip.compress(encoded, compresslevel=1)
+    log.debug("Making cloud request with %d elements. %s. %.2fB / element ",
+              len(batch), fmt_bytes(len(payload)), len(payload) / len(batch))
+    try:
+        resp = requests.post(url, data=payload, headers=headers)
+    except requests.exceptions.ConnectionError:
+        raise RemoteError("Fastmap could not connect to the cloud server. Check your connection.")
+    if resp.status_code == 200:
         resp_dict = pickle.loads(base64.b64decode(resp.content))
-        redecoding_time = time.perf_counter() - start
-
         results = resp_dict['results']
         remote_cid = resp.headers['X-Container-Id']
         remote_tid = resp.headers['X-Thread-Id']
 
-        total_request = encoding_time + req_time + redecoding_time
+        total_request = time.perf_counter() - start_req_time
         total_application = float(resp.headers['X-Total-Seconds'])
-        total_processing = resp_dict['map_seconds']
+        total_mapping = resp_dict['map_seconds']
         req_time_per_el = total_request / len(results)
         app_time_per_el = total_application / len(results)
-        proc_time_per_el = total_processing / len(results)
+        map_time_per_el = total_mapping / len(results)
 
-        logit("Got %d results from %s/%s in thread %d",
-              len(results), remote_cid, remote_tid, thread_id)
-        logit("Batch processed for %.2f/%.2f/%.2f map/app/req (%.2e/%.2e/%.2e per element)",
-              total_processing, total_application, total_request, proc_time_per_el,
-              app_time_per_el, req_time_per_el)
+        log.debug("Got %d results from %s/%s",
+                  len(results), remote_cid, remote_tid)
+        log.debug("Batch processed for %.2f/%.2f/%.2f map/app/req (%.2e/%.2e/%.2e per element)",
+                  total_mapping, total_application, total_request, map_time_per_el,
+                  app_time_per_el, req_time_per_el)
         itdm.push_outbox(batch_idx,
                          results,
                          None,
-                         vcpu_seconds=total_application)
+                         vcpu_seconds=total_application,
+                         network_seconds=total_request-total_application)
+        return
+
+    if resp.status_code == 401:
+        raise RemoteError("Unauthorized. Check your API token.")
+    if resp.status_code == 402:
+        raise RemoteError("You do not have enough vCPU-hour credits to make this request. "
+                    "You have %.2f available but the remote process is requiring %.2f. "
+                    "Buy more vCPU-hours at https://fastmap.io", -1, -1)
+    if resp.status_code == 400:
+        raise RemoteError("Your code could not be processed remotely. Check your code for errors.")
+    raise RemoteError("Unexpected remote error %d %r", resp.status_code, pickle.loads(resp.content))
+
+
+
+def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
+                             itdm, secret, log, error_queue):
+
+    batch_tup = itdm.checkout()
+    headers = get_headers(secret)
+    req_dict = {
+        'func': encoded_func,
+        'func_hash': func_hash,
+    }
+    url = cloud_url_base + '/api/v1/execute'
+
+    while batch_tup:
+        try:
+            process_one_batch_remotely(itdm, batch_tup, url, req_dict, headers, log)
+        except Exception as e:
+            proc_name = multiprocessing.current_process().name
+            thread_id = threading.get_ident()
+            error_queue.put(("%s: thread:%d" % (proc_name, thread_id), repr(e)))
+            break
         batch_tup = itdm.checkout()
 
 
 class _RemoteProcessor(multiprocessing.Process):
-    def __init__(self, func, itdm, parent):
+    def __init__(self, func, itdm, config, error_queue):
         multiprocessing.Process.__init__(self)
         self.itdm = itdm
         self.func = func
+        self.error_queue = error_queue
 
         pickled_func = dill.dumps(func)
         self.func_hash = get_hash(pickled_func)
         self.encoded_func = pickled_func
 
-        self.log = parent.log
-        self.max_cloud_connections = parent.max_cloud_connections
-        self.cloud_url_base = parent.cloud_url_base
-        self.secret = parent.secret
-        self.log.info("Started remote processor. Func payload is %dB", len(self.encoded_func))
+        self.log = config.log
+        self.max_cloud_connections = config.max_cloud_connections
+        self.cloud_url_base = config.cloud_url_base
+        self.secret = config.secret
+        self.log.info("Initialized remote processor. Func payload is %dB", len(self.encoded_func))
+
+    def start(self):
+        # TODO did I want to use this for something? It does trigger and does so before .run
+        super(_RemoteProcessor, self).start()
 
     def run(self):
         threads = []
+
+        batch_tup = self.itdm.checkout()
+        headers = get_headers(self.secret)
+        req_dict = {
+            'func': self.encoded_func,
+            'func_hash': self.func_hash,
+        }
+        url = self.cloud_url_base + '/api/v1/execute'
+
+        try:
+            process_one_batch_remotely(self.itdm, batch_tup, url, req_dict, headers, self.log)
+        except Exception as e:
+            self.error_queue.put((multiprocessing.current_process().name, repr(e)))
+            return
+
         self.log.debug("Opening %d remote connection(s)", self.max_cloud_connections)
         for thread_id in range(self.max_cloud_connections):
             self.log.debug("Creating remote thread %r", thread_id)
             thread_args = (thread_id, self.cloud_url_base, self.func_hash, self.encoded_func,
-                           self.itdm, self.secret, self.log)
+                           self.itdm, self.secret, self.log, self.error_queue)
             thread = threading.Thread(target=remote_connection_thread, args=thread_args)
             thread.start()
             threads.append(thread)
@@ -293,83 +270,201 @@ class _RemoteProcessor(multiprocessing.Process):
             thread.join()
 
 
+
 class InterThreadDataManager():
 
-    def __init__(self, iterable_len=None, max_inbox=None):
+    def __init__(self, iterable, first_runtime, max_batches_in_queue):
         manager = multiprocessing.Manager()
         self._lock = multiprocessing.Lock()
-        self._inbox = manager.list()
+        self._get_lock = multiprocessing.Lock()
+        self._inbox = multiprocessing.Queue()
         self._outbox = manager.list()
         self._runtimes = manager.list()
         # self._loans = manager.dict()
 
+        self._runtimes.append(first_runtime)
+
         self.state = manager.dict()
-        self.state['inbox_done'] = False
-        self.state['iterable_len'] = iterable_len
-        self.state['max_inbox'] = max_inbox
+        self.state['inbox_capped'] = False
+        self.state['num_batches_put_in_inbox'] = None
         self.state['total_vcpu_seconds'] = 0.0
+        self.state['total_network_seconds'] = 0.0
 
-    def mark_inbox_done(self):
+        self.batch_goal_time = 1.0
+
+    def has_more_batches(self, cur_idx):
+        if not self.state['inbox_capped']:
+            return True
+        return cur_idx < self.state['num_batches_put_in_inbox']
+
+    def get_total_vcpu_seconds(self):
+        return self.state['total_vcpu_seconds']
+
+    def get_total_network_seconds(self):
+        return self.state['total_network_seconds']
+
+    def kill(self):
         with self._lock:
-            assert not self.state['inbox_done']
-            self.state['inbox_done'] = True
+            self.state['inbox_capped'] = True
+            try:
+                while True:
+                    self._inbox.get_nowait()
+            except multiprocessing.queues.Empty:
+                pass
+            self._outbox = None
+            self._runtimes = None
 
-    def push_inbox(self, item_tup):
-        while True:
-            with self._lock:
-                if self.state['max_inbox'] is None or len(self._inbox) < self.state['max_inbox']:
-                    assert isinstance(item_tup, tuple) and len(item_tup) == 2
-                    if self.state['inbox_done']:
-                        raise AssertionError
-                    self._inbox.append(item_tup)
-                    return
+    def mark_inbox_capped(self, cnt):
+        with self._lock:
+            assert not self.state['inbox_capped']
+            self.state['inbox_capped'] = True
+            self.state['num_batches_put_in_inbox'] = cnt
+            # self._inbox.close()
+
+    def push_inbox(self, item):
+        with self._lock:
+            assert not self.state['inbox_capped']
+            self._inbox.put(item)
+
+    def _running_avg_runtime(self):
+        last_five = self._runtimes[-5:]
+        return sum(last_five) / len(last_five)
+
+    def total_avg_runtime(self):
+        try:
+            return sum(self._runtimes) / len(self._runtimes)
+        except ZeroDivisionError:
+            return None
+
+    def _batch_size(self):
+        ret = int(self.batch_goal_time / self._running_avg_runtime())
+        return ret
 
     def checkout(self):
         while True:
-            with self._lock:
-                if self.state['inbox_done'] and not len(self._inbox):
+            if self.state['inbox_capped']:
+                try:
+                    return self._inbox.get_nowait()
+                except multiprocessing.queues.Empty:
                     return None
-                if self._inbox:
-                    item_tup = self._inbox.pop(0)
-                    # self._loans[item_tup[0]] = item_tup[1]
-                    return item_tup
+            try:
+                return self._inbox.get(timeout=.01)
+            except multiprocessing.queues.Empty:
+                pass
 
-    def push_outbox(self, item_idx, result, runtime, vcpu_seconds=None):
+    def push_outbox(self, item_idx, result, runtime, vcpu_seconds=None, network_seconds=None):
         with self._lock:
             self._outbox.append((item_idx, result))
             if runtime:
                 self._runtimes.append(runtime)
             if vcpu_seconds:
                 self.state['total_vcpu_seconds'] += vcpu_seconds
+            if network_seconds:
+                self.state['total_network_seconds'] += network_seconds
             # del self._loans[item_idx]
 
     def pop_outbox(self, processors):
         while True:
             with self._lock:
                 if len(self._outbox):
+                    # print("popping outbox in InterThreadDataManager. Length of outbox", len(self._outbox))
                     return self._outbox.pop(0)
             if not any(p.is_alive() for p in processors):
-                raise ExecutionException("Every process died. Check for errors in your code")
+                raise ExecutionException("Every execution process died. Check for errors in your code.")
             time.sleep(.01)
 
-    def reprocess_loans(self):
-        with self._lock:
-            self._inbox = sorted(self._loans.items()) + self._inbox
-            # self._loans = {}
+    # def reprocess_loans(self):
+    #     with self._lock:
+    #         self._inbox = sorted(self._loans.items()) + self._inbox
+    #         # self._loans = {}
+
+class _FillInbox(threading.Thread):
+    def __init__(self, iterable, itdm, log, avg_runtime, *args, **kwargs):
+        self.iterable = iterable
+        self.itdm = itdm
+        self.log = log
+        self.avg_runtime = avg_runtime
+        self.cnt = 0
+        self.do_die = False
+        self.capped = False
+        super(_FillInbox, self).__init__(*args, **kwargs)
+
+    def kill(self):
+        self.do_die = True
+
+    def batch_size(self):
+        return max(1, int(.2 / self.avg_runtime))
 
 
-def fill_inbox(batch_generator, itdm):
-    batch_tup = batch_generator.next()
-    while batch_tup:
-        itdm.push_inbox(batch_tup)
+class FillInboxWithIter(_FillInbox):
+    def run(self):
+        """
+        Adapted from answer found here:
+        https://stackoverflow.com/questions/8290397/how-to-split-an-iterable-in-constant-size-chunks
+        Validated that this works well as an iterable (e.g. will yield JIT for slow generators)
+        """
+        batch_cnt = 0
+        element_cnt = 0
+        args = [self.iterable] * self.batch_size()
+        for batch in map(lambda l: list(filter(None, l)),
+                         itertools.zip_longest(*args, fillvalue=None)):
+            self.itdm.push_inbox((batch_cnt, batch))
+            batch_cnt += 1
+            element_cnt += len(batch)
+            if self.do_die:
+                return
+        self.log.debug("Finished adding iterator to the task queue. %d batches. %d elements",
+                       batch_cnt, element_cnt)
+        self.itdm.mark_inbox_capped(batch_cnt)
 
-        last_runtimes = itdm._runtimes[-5:]
-        try:
-            last_runtime = sum(last_runtimes) / len(last_runtimes)
-        except ZeroDivisionError:
-            last_runtime = None
-        batch_tup = batch_generator.next(last_runtime)
-    itdm.mark_inbox_done()
+
+class FillInboxWithList(_FillInbox):
+    def run(self):
+        batch_size = self.batch_size()
+
+        iterable_len = len(self.iterable)
+        batch_cnt = 0
+        element_cnt = 0
+        for idx in range(0, iterable_len, batch_size):
+            batch = self.iterable[idx:min(idx + batch_size, iterable_len)]
+            self.itdm.push_inbox((batch_cnt, batch))
+            batch_cnt += 1
+            element_cnt += len(batch)
+            if self.do_die:
+                return
+        self.log.debug("Finished adding list to the task queue. %d batches. %d elements",
+                       batch_cnt, element_cnt)
+        self.itdm.mark_inbox_capped(batch_cnt)
+
+
+class FastmapLogger():
+    """
+    This exists because of the difficulty with passing python's native logger between processes
+    """
+    def __init__(self, verbosity):
+        if verbosity == Verbosity.LOUD:
+            pass
+        elif verbosity == Verbosity.NORMAL:
+            self.debug = lambda *args: None
+        elif verbosity == Verbosity.QUIET:
+            self.debug = lambda *args: None
+            self.info = lambda *args: None
+        else:
+            raise AssertionError(f"Unknown value for verbosity '{verbosity}'")
+
+    def debug(self, msg, *args):
+        msg = msg % args
+        print("fastmap DEBUG:", msg)
+
+    def info(self, msg, *args):
+        msg = msg % args
+        print("fastmap INFO:", msg)
+
+    def warning(self, msg, *args):
+        msg = msg % args
+        print("fastmap WARNING:", msg)
+
+
 
 
 class FastmapConfig():
@@ -385,8 +480,7 @@ class FastmapConfig():
     def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
                  exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
                  all_local_threads=False):
-        self.exec_policy = exec_policy
-        self._init_exec_policy(verbosity)
+        self._init_exec_policy(exec_policy)
         self._init_logging(verbosity)
         self.confirm_charges = confirm_charges
         self.num_local_threads = os.cpu_count()
@@ -397,7 +491,7 @@ class FastmapConfig():
             self.secret = secret
         else:
             self.secret = None
-            self.exec_policy = "LOCAL"
+            self.exec_policy = ExecPolicy.LOCAL
             self.log.warning("No secret provided. The exec_policy is now set to LOCAL")
 
         # try:
@@ -418,34 +512,56 @@ class FastmapConfig():
     @set_docstring(FASTMAP_DOCSTRING)
     def fastmap(self, func, iterable):
         start_time = time.perf_counter()
-        fastmapper = _FastMapper(self)
+        fastmapper = FastMapper(self)
+        is_list = hasattr(iterable, '__len__')
 
-        if hasattr(iterable, '__len__'):
-            total_unprocessed = len(iterable)
+        try:
+            if self.verbosity == Verbosity.QUIET:
+                for batch in fastmapper.fastmap(func, iterable, is_list=is_list):
+                    for el in batch:
+                        yield el
+                return
+
             total_processed = 0
-            for batch in fastmapper.fastmap(func, iterable):
-                for el in batch:
-                    yield el
-                total_processed += len(batch)
-                percent = total_processed / total_unprocessed * 100
-                graph_bar = '█' * int(percent / 2)
-                sys.stdout.write('fastmap: \033[92m%s %.1f%%\r\033[0m' % (graph_bar, percent))
-                sys.stdout.flush()
-            print()
-        else:
-            total_processed = 0
-            for batch in fastmapper.fastmap(func, iterable):
-                for el in batch:
-                    yield el
-                total_processed += len(batch)
-                sys.stdout.write('fastmap: processed %d\r' % total_processed)
-                sys.stdout.flush()
-            print()
+            if is_list:
+                total_unprocessed = len(iterable)
+                for batch in fastmapper.fastmap(func, iterable, is_list=True):
+                    for el in batch:
+                        yield el
+                    total_processed += len(batch)
+                    percent = total_processed / total_unprocessed * 100
+                    graph_bar = '█' * int(percent / 2)
+                    sys.stdout.write('fastmap: \033[92m%s %.1f%%\r\033[0m' % (graph_bar, percent))
+                    sys.stdout.flush()
+            else:
+                for batch in fastmapper.fastmap(func, iterable, is_list=False):
+                    for el in batch:
+                        yield el
+                    total_processed += len(batch)
+                    sys.stdout.write('fastmap: Processed %d\r' % total_processed)
+                    sys.stdout.flush()
+        except Exception as e:
+            try:
+                while True:
+                    process_error = fastmapper.error_queue.get_nowait()
+                    self.log.warning(" Process error [%s]: %s", process_error[0], process_error[1])
+            except multiprocessing.queues.Empty:
+                pass
+            fastmapper.cleanup()
+            raise ExecutionException() from e
+
         total_duration = time.perf_counter() - start_time
-        network_duration = -1
+        self._log_final_stats(fastmapper.avg_runtime, total_processed, total_duration,
+                              fastmapper.total_network_seconds, fastmapper.total_vcpu_seconds)
 
-        if fastmapper.avg_runtime:
-            time_saved = fastmapper.avg_runtime * total_processed - total_duration
+    def _log_final_stats(self, avg_runtime, total_processed, total_duration,
+                         total_network_seconds, total_vcpu_seconds):
+
+        print()
+        if not avg_runtime:
+            self.log.info("Fastmap processing done.")
+        else:
+            time_saved = avg_runtime * total_processed - total_duration
             if time_saved > 3600:
                 self.log.info("Processed %d elements in %.2fs. "
                               "You saved %.2f hours",
@@ -462,7 +578,7 @@ class FastmapConfig():
                 self.log.info("Processed %d elements in %.2fs. "
                               "This ran at about the same speed as the builtin map.",
                               total_processed, total_duration)
-            elif self.exec_policy == "LOCAL":
+            elif self.exec_policy == ExecPolicy.LOCAL:
                 self.log.info("Processed %d elements in %.2fs. "
                               "This ran slower than the map builtin by %.2f seconds (estimate). "
                               "Consider not using fastmap here.",
@@ -470,82 +586,77 @@ class FastmapConfig():
             else:
                 self.log.info("Processed %d elements in %.2fs. "
                               "This ran slower than the map builtin by %.2f seconds (estimate). "
-                              "Network transfer accounts for %.2f of this duration. "
+                              "Network transfer accounts for %.2fs of this duration. "
                               "Consider upgrading your connection, reducing your data size, "
                               "or using exec_policy LOCAL or ADAPTIVE.",
-                              total_processed, total_duration, time_saved * -1, network_duration)
-        else:
-            self.log.info("Fastmap processing done.")
+                              total_processed, total_duration, time_saved * -1,
+                              total_network_seconds)
 
-        if fastmapper.total_vcpu_seconds:
-            self.log.debug("Used %.4f vCPU-hours.", fastmapper.total_vcpu_seconds/60/60)
+        if total_vcpu_seconds:
+            self.log.info("Used %.4f vCPU-hours.", total_vcpu_seconds/60/60)
 
-    @set_docstring(FASTRUN_DOCSTRING)
-    def fastrun(self, func, *args, **kwargs):
-        start_time = time.perf_counter()
-        if self.exec_policy == "LOCAL":
-            queue = multiprocessing.Queue()
-            proc = multiprocessing.Process(_fastrun_local, (queue, func, args, kwargs))
-            proc.start()
-            proc.join()
-            results = queue.get()
-            runtime = time.perf_counter() - start_time
-            self.log.info("Fastrun processing done in %.2f.", runtime)
-            return results
+    # @set_docstring(FASTRUN_DOCSTRING)
+    # def fastrun(self, func, *args, **kwargs):
+    #     start_time = time.perf_counter()
+    #     if self.exec_policy == "LOCAL":
+    #         queue = multiprocessing.Queue()
+    #         proc = multiprocessing.Process(_fastrun_local, (queue, func, args, kwargs))
+    #         proc.start()
+    #         proc.join()
+    #         results = queue.get()
+    #         runtime = time.perf_counter() - start_time
+    #         self.log.info("Fastrun processing done in %.2f.", runtime)
+    #         return results
 
-        req_dict = {
-            "func": dill.dumps(func),
-            "args": args,
-            "kwargs": kwargs
-            }
-        pickled = pickle.dumps(req_dict)
-        encoded = base64.b64encode(pickled)
-        payload = gzip.compress(encoded, compresslevel=1)
+    #     req_dict = {
+    #         "func": dill.dumps(func),
+    #         "args": args,
+    #         "kwargs": kwargs
+    #         }
+    #     pickled = pickle.dumps(req_dict)
+    #     encoded = base64.b64encode(pickled)
+    #     payload = gzip.compress(encoded, compresslevel=1)
 
-        resp = requests.post(self.cloud_url_base + "/api/v1/run", data=payload,
-                             headers=get_additional_headers(self.secret))
-        resp_dict = pickle.loads(resp.content)
-        if resp.status_code != 200:
-            raise ExecutionException("Remote error %r" % resp_dict)
-
-        runtime = time.perf_counter() - start_time
-        self.log.info("Fastrun processing done in %.2f.", runtime)
-        self.log.debug("Used %.4f vCPU-hours", resp.headers['vcpu_seconds']/60/60)
-        return resp_dict['result']
-
+    #     resp = requests.post(self.cloud_url_base + "/api/v1/run", data=payload,
+    #                          headers=get_headers(self.secret))
+    #     resp_dict = pickle.loads(resp.content)
+    #     if resp.status_code == 200:
+    #         runtime = time.perf_counter() - start_time
+    #         self.log.info("Fastrun processing done in %.2f.", runtime)
+    #         self.log.debug("Used %.4f vCPU-hours", resp.headers['vcpu_seconds']/60/60)
+    #         return resp_dict['result']
+    #     if resp.status_code == 401:
+    #         raise UnauthorizedException("Bad client token")
+    #     else:
+    #         raise ExecutionException("Remote error %r" % resp_dict)
 
     def _init_exec_policy(self, exec_policy):
-        pass  # TODO
-        # if exec_policy == "LOCAL":
-        #     self.runners = (_local_run,)
-        # elif exec_policy == "CLOUD":
-        #     self.runners = (_cloud_run,)
-        # elif exec_policy == "ADAPTIVE":
-        #     self.runners = (_local_run, _cloud_run)
-        # else:
-        #     raise AssertionError(f"Unknown value for exec_policy '{exec_policy}'")
-        # self.exec_policy = exec_policy
+        if exec_policy not in (ExecPolicy.ADAPTIVE, ExecPolicy.CLOUD, ExecPolicy.LOCAL):
+            raise AssertionError(f"Unknown value for exec_policy '{exec_policy}'")
+        self.exec_policy = exec_policy
 
     def _init_logging(self, verbosity):
-        self.log = logging.getLogger('fastmap')
-
-        if verbosity == Verbosity.QUIET:
-            self.log.setLevel(logging.CRITICAL)
-        elif verbosity == Verbosity.NORMAL:
-            self.log.setLevel(logging.INFO)
-        elif verbosity == Verbosity.LOUD:
-            self.log.setLevel(logging.DEBUG)
-        else:
-            raise AssertionError(f"Unknown value for verbosity '{verbosity}'")
+        self.log = FastmapLogger(verbosity)
         self.verbosity = verbosity
+        # self.log = logging.getLogger('fastmap')
 
-        ch = logging.StreamHandler()
-        formatter = logging.Formatter('%(name)s: %(message)s')
-        ch.setFormatter(formatter)
-        self.log.addHandler(ch)
+        # if verbosity == Verbosity.QUIET:
+        #     self.log.setLevel(logging.CRITICAL)
+        # elif verbosity == Verbosity.NORMAL:
+        #     self.log.setLevel(logging.INFO)
+        # elif verbosity == Verbosity.LOUD:
+        #     self.log.setLevel(logging.DEBUG)
+        # else:
+        #     raise AssertionError(f"Unknown value for verbosity '{verbosity}'")
+        # self.verbosity = verbosity
+
+        # ch = logging.StreamHandler()
+        # formatter = logging.Formatter('%(name)s: %(message)s')
+        # ch.setFormatter(formatter)
+        # self.log.addHandler(ch)
 
 
-class _FastMapper():
+class FastMapper():
     """
     Wrapper for running fastmap. Maintains state variables including
     iterable_len and avg_runtime.
@@ -553,100 +664,149 @@ class _FastMapper():
     def __init__(self, config):
         self.config = config
         self.log = config.log
-        self.iterable_len = None
         self.avg_runtime = None
+        self.total_vcpu_seconds = 0
+        self.total_network_seconds = 0
+        self.error_queue = multiprocessing.Queue()
 
-    def _estimated_runtime(self):
-        if self.avg_runtime and self.iterable_len:
-            return self.avg_runtime * self.iterable_len
-        return None
+    def _get_vcpu_hours_estimate(self, iterable_len):
+        # TODO take local processing into account
+        return self.avg_runtime * iterable_len / 60.0 / 60.0
 
-    def _get_processors(self, func):
-        if self.config.exec_policy == 'CLOUD':
+    def _confirm_charges(self, iterable):
+        if not self.config.confirm_charges:
+            return True
+        while True:
+            if hasattr(iterable, "__len__"):
+                user_input_question = "Estimated cloud usage of %.4f vCPU-hours." \
+                                      " Continue?" % self._get_vcpu_hours_estimate(len(iterable))
+            else:
+                user_input_question = "Unable to estimate cloud usage because " \
+                                      "sequence was an iterable. Continue anyway?"
+            user_input = input("\nfastmap: %s (y/n) " % user_input_question)
+            if user_input.lower() == 'y':
+                return True
+            elif user_input.lower() == 'n':
+                if self.config.exec_policy == ExecPolicy.ADAPTIVE:
+                    self.log.info("Cloud operation cancelled. Continuing processing locallly...")
+                return False
+            else:
+                self.log.warning("Unrecognized input of %r. Please input 'y' or 'n'" % user_input)
+
+
+    def _get_processors(self, func, iterable):
+        if self.config.exec_policy == ExecPolicy.CLOUD:
             max_batches_in_queue = self.config.max_cloud_connections  # TODO make this smarter
-        elif self.config.exec_policy == 'LOCAL':
+        elif self.config.exec_policy == ExecPolicy.LOCAL:
             max_batches_in_queue = self.config.num_local_threads
         else:
             max_batches_in_queue = self.config.num_local_threads + self.config.max_cloud_connections
 
-        itdm = InterThreadDataManager(self.iterable_len, max_batches_in_queue)
+        itdm = InterThreadDataManager(iterable, self.avg_runtime, max_batches_in_queue)
 
         processors = []
-        if self.config.exec_policy != 'CLOUD':
+        if self.config.exec_policy != ExecPolicy.CLOUD:
             for _ in range(self.config.num_local_threads):
-                process_args = (func, itdm, self.log)
+                process_args = (func, itdm, self.log, self.error_queue)
                 local_process = multiprocessing.Process(target=process_local, args=process_args)
                 local_process.start()
                 processors.append(local_process)
             self.log.debug("Launching %d local processes", self.config.num_local_threads)
-        if self.config.exec_policy != 'LOCAL':
-            remote_process = _RemoteProcessor(func, itdm, self.config)
-            remote_process.start()
-            processors.append(remote_process)
+        if self.config.exec_policy != ExecPolicy.LOCAL:
+            if self._confirm_charges(iterable):
+                remote_process = _RemoteProcessor(func, itdm, self.config, self.error_queue)
+                remote_process.start()
+                processors.append(remote_process)
+
+        if not processors or not any(p.is_alive() for p in processors):
+            raise ExecutionException("No execution processes started. " \
+                                            "Try modifying your fastmap configuration.")
+
         return processors, itdm
 
-    def fastmap(self, func, iterable):
-        self.log.debug(f"Running fastmap on {func.__name__}")
-
-        self.avg_runtime = None
-        if hasattr(iterable, "__len__"):
-            self.iterable_len = len(iterable)
-        else:
-            self.iterable_len = None
-
-        iterable = iter(iterable)
-
+    def initial_run(self, func, iterable):
         start_timing_loop = time.perf_counter()
+        iterable = iter(iterable)
         ret = []
-        while time.perf_counter() - start_timing_loop < INITIAL_RUN_DUR:
+        end_loop_at = start_timing_loop + INITIAL_RUN_DUR
+        while time.perf_counter() < end_loop_at:
             try:
                 item = next(iterable)
             except StopIteration:
                 self.avg_runtime = (time.perf_counter() - start_timing_loop) / len(ret)
                 self.log.debug(f"Fastmap finished faster than {INITIAL_RUN_DUR} seconds")
-                yield ret
-                return
+                return ret, False
             ret.append(func(item))
-        self.avg_runtime = (time.perf_counter() - start_timing_loop) / len(ret)
+        first_batch_run_time = time.perf_counter() - start_timing_loop
+        len_first_batch = len(ret)
+        self.avg_runtime = first_batch_run_time / len_first_batch
+        self.log.debug("Processed first %d results in %.2f seconds (%e per element)",
+                       len_first_batch, first_batch_run_time, self.avg_runtime)
+        return ret, True
 
-        total_yielded = len(ret)
-        yield ret
 
-        # if self.iterable_len:
-        #     total_process_overhead = self.config.num_local_threads * PROCESS_OVERHEAD
-        #     total_process_time_estimate = self.estimated_run_time() / self.config.num_local_threads
-        #     if self.estimated_run_time() > total_process_overhead + total_process_time_estimate:
-        #         iterable = list(iterable)
-        #         yield list(map(func, iterable))
+    def fastmap(self, func, iterable, is_list=False):
+        if is_list:
+            iterable_len = len(iterable)
+            self.log.debug("Applying %r to %d items and yielding the results.",
+                           func.__name__, iterable_len)
+        else:
+            self.log.debug("Appling %r to an iterator and yielding the results.", func.__name__)
 
-        #     if estimated_run_time < CLOUD_OVERHEAD:
-        #         with multiprocessing.Pool(self.config.num_local_threads) as pool:
-        #             yield pool.map(func, iterable)
-        #         return
+        initial_batch, has_more = self.initial_run(func, iterable)
+        yield initial_batch
+        if not has_more:
+            return
 
-        processors, itdm = self._get_processors(func)
-        batch_generator = BatchGenerator(iterable, self.avg_runtime)
+        if is_list:
+            iterable = iterable[len(initial_batch):]
 
-        fill_inbox_thread = threading.Thread(target=fill_inbox,
-                                             args=(batch_generator, itdm))
+        if False and is_list and self.config.exec_policy != ExecPolicy.CLOUD:
+            total_process_overhead = self.config.num_local_threads * PROCESS_OVERHEAD
+            estimated_runtime = self.avg_runtime * len(iterable)
+            total_process_time_estimate = estimated_runtime / self.config.num_local_threads
+            if estimated_runtime > total_process_overhead + total_process_time_estimate:
+                self.log.debug("Running single threaded due to short expected runtime")
+                iterable = list(iterable)
+                yield list(map(func, iterable))
+                return
+
+        processors, itdm = self._get_processors(func, iterable)
+
+        if is_list:
+            fill_inbox_thread = FillInboxWithList(iterable, itdm, self.log, self.avg_runtime)
+        else:
+            fill_inbox_thread = FillInboxWithIter(iterable, itdm, self.log, self.avg_runtime)
         fill_inbox_thread.start()
+
+        def cleanup():
+            self.log.warning("Cleaning up threads and processes because of error...")
+            for p in processors:
+                p.join()
+            try:
+                fill_inbox_thread.kill()
+            finally:
+                fill_inbox_thread.join()
+            itdm.kill()
+            self.log.warning("Threads and processes clean.")
+        # atexit.register(cleanup)
+        self.cleanup = cleanup
 
         cur_idx = 0
         staging = {}
-        while not itdm.state['inbox_done'] or cur_idx < batch_generator.num_batches_made():
+        while itdm.has_more_batches(cur_idx):
             result_idx, result_list = itdm.pop_outbox(processors)
             staging[result_idx] = result_list
             while cur_idx in staging:
                 to_yield = staging.pop(cur_idx)
                 yield to_yield
-                total_yielded += len(to_yield)
                 cur_idx += 1
 
+        self.log.debug("Cleaning up threads and processes...")
         fill_inbox_thread.join()
-
         for processor in processors:
             processor.join()
 
-        self.avg_runtime = batch_generator.total_avg_runtime()
-        self.total_vcpu_seconds = itdm.state['total_vcpu_seconds']
-        self.iterable_len = batch_generator.element_cnt
+        self.total_vcpu_seconds = itdm.get_total_vcpu_seconds()
+        self.avg_runtime = itdm.total_avg_runtime()
+        self.total_network_seconds = itdm.get_total_network_seconds()
