@@ -1,5 +1,7 @@
 .DSStore
 __pycache__
+htmlcov
+.coverage
 *.egg-info
 *.eggs
 *.pyc

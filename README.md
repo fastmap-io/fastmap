@@ -49,7 +49,7 @@ results = fastmap(big_function, long_list)
 
 ### When should you use fastmap?
 
-Use fastmap whenever you have a function that needs to process many elements. The function must be a "[pure function](https://en.wikipedia.org/wiki/Pure_function)" meaning that it doesn't depend on state and has no side effects (like making network calls or altering state). Many calls to `map` will already fit this criteria.
+Use fastmap whenever you have a function that needs to process many elements. The function must be stateless and cannot utilize the network or the filesystem. Chances are good that your calls to `map` will already fit this criteria.
 
 
 ### Tips for specific use cases
@@ -67,10 +67,11 @@ No problem! You can still run fastmap without a fastmap.io account. Instead of p
 ### Limitations
 
 1. Fastmap.io is a prepaid service. You must have credits in your fastmap.io account to take advantage of the cloud functionality.
-2. Network calls are not supported. For security, we run your code in a sandbox.
-3. Fastmap only works on code without
+2. Code which utilizes the network and the filesystem are not supported. For security, on the cloud, we isolate your code in a sandbox.
+3. Our sandbox is limited to 1GB of memory. In practice, your code's memory limit will be slightly lower.
+
 
 
 ### Questions
 
-Fastmap.io is a new project and we would love to hear your feedback. You can contact the CEO directly at scott@fastmap.io.
+Fastmap.io is a new project and I would love to hear your feedback. You can contact me directly at scott@fastmap.io.
