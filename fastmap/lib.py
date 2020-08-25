@@ -13,6 +13,8 @@ import dill
 # import psutil
 import requests
 
+CLIENT_VERSION = "0.0.1"
+
 FASTMAP_DOCSTRING = """
     Map a function over an iterable and return the results.
     Depending on prior configuration, fastmap will run either locally via multiprocessing,
@@ -137,12 +139,13 @@ def _fastrun_local(queue, func, args, kwargs):
     queue.put(func(*args, **kwargs))
 
 
-def get_headers(secret):
+def create_headers(secret):
     """Get headers for communicating with the fastmap.io cloud service"""
     return {
         'Authorization': 'Bearer ' + secret,
         'Content-Encoding': 'gzip',
         'X-Python-Version': sys.version.replace('\n', ''),
+        'X-Client-Version': CLIENT_VERSION,
     }
 
 
@@ -207,12 +210,12 @@ def remote_connection_thread(thread_id, cloud_url_base, func_hash, encoded_func,
                              itdm, secret, log, error_queue):
 
     batch_tup = itdm.checkout()
-    headers = get_headers(secret)
+    headers = create_headers(secret)
     req_dict = {
         'func': encoded_func,
         'func_hash': func_hash,
     }
-    url = cloud_url_base + '/api/v1/execute'
+    url = cloud_url_base + '/api/v1/map'
 
     while batch_tup:
         try:
@@ -250,7 +253,7 @@ class _RemoteProcessor(multiprocessing.Process):
         threads = []
 
         batch_tup = self.itdm.checkout()
-        headers = get_headers(self.secret)
+        headers = create_headers(self.secret)
         req_dict = {
             'func': self.encoded_func,
             'func_hash': self.func_hash,
@@ -607,40 +610,6 @@ class FastmapConfig():
         if total_vcpu_seconds:
             self.log.info("Used %.4f vCPU-hours.", total_vcpu_seconds/60/60)
 
-    # @set_docstring(FASTRUN_DOCSTRING)
-    # def fastrun(self, func, *args, **kwargs):
-    #     start_time = time.perf_counter()
-    #     if self.exec_policy == "LOCAL":
-    #         queue = multiprocessing.Queue()
-    #         proc = multiprocessing.Process(_fastrun_local, (queue, func, args, kwargs))
-    #         proc.start()
-    #         proc.join()
-    #         results = queue.get()
-    #         runtime = time.perf_counter() - start_time
-    #         self.log.info("Fastrun processing done in %.2f.", runtime)
-    #         return results
-
-    #     req_dict = {
-    #         "func": dill.dumps(func),
-    #         "args": args,
-    #         "kwargs": kwargs
-    #         }
-    #     pickled = pickle.dumps(req_dict)
-    #     encoded = base64.b64encode(pickled)
-    #     payload = gzip.compress(encoded, compresslevel=1)
-
-    #     resp = requests.post(self.cloud_url_base + "/api/v1/run", data=payload,
-    #                          headers=get_headers(self.secret))
-    #     resp_dict = pickle.loads(resp.content)
-    #     if resp.status_code == 200:
-    #         runtime = time.perf_counter() - start_time
-    #         self.log.info("Fastrun processing done in %.2f.", runtime)
-    #         self.log.debug("Used %.4f vCPU-hours", resp.headers['vcpu_seconds']/60/60)
-    #         return resp_dict['result']
-    #     if resp.status_code == 401:
-    #         raise UnauthorizedException("Bad client token")
-    #     else:
-    #         raise ExecutionError("Remote error %r" % resp_dict)
 
     def _init_exec_policy(self, exec_policy):
         if exec_policy not in (ExecPolicy.ADAPTIVE, ExecPolicy.CLOUD, ExecPolicy.LOCAL):
@@ -650,22 +619,6 @@ class FastmapConfig():
     def _init_logging(self, verbosity):
         self.log = FastmapLogger(verbosity)
         self.verbosity = verbosity
-        # self.log = logging.getLogger('fastmap')
-
-        # if verbosity == Verbosity.QUIET:
-        #     self.log.setLevel(logging.CRITICAL)
-        # elif verbosity == Verbosity.NORMAL:
-        #     self.log.setLevel(logging.INFO)
-        # elif verbosity == Verbosity.LOUD:
-        #     self.log.setLevel(logging.DEBUG)
-        # else:
-        #     raise AssertionError(f"Unknown value for verbosity '{verbosity}'")
-        # self.verbosity = verbosity
-
-        # ch = logging.StreamHandler()
-        # formatter = logging.Formatter('%(name)s: %(message)s')
-        # ch.setFormatter(formatter)
-        # self.log.addHandler(ch)
 
 
 class FastMapper():

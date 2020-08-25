@@ -1,6 +1,6 @@
 > Note: Fastmap is currently in alpha and new fastmap.io accounts are invite-only. Alpha software often has bugs and service disruptions. While unintended, expect both until fastmap graduates to beta. If you are reading this, you are the salt-of-the-earth and I could use your help working out the kinks. Email me for a token!
 
-![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-red)
+![Version 0.0.1](https://img.shields.io/badge/version-0.0.1-red)
 
 ### Zero setup distributed computing
 
@@ -65,10 +65,10 @@ No problem! You can still run fastmap without a fastmap.io account. Instead of p
 
 
 ### Limitations
-
+1. This is for Python 3.5+. Python 2 is not supported.
 1. Fastmap.io is a prepaid service. You must have credits in your fastmap.io account to take advantage of the cloud functionality.
-2. Code which utilizes the network and the filesystem are not supported. For security, on the cloud, we isolate your code in a sandbox.
-3. Our sandbox is limited to 1GB of memory. In practice, your code's memory limit will be slightly lower.
+1. Code which utilizes the network and the filesystem are not supported. For security, on the cloud, we isolate your code in a sandbox.
+1. Our sandbox is limited to 1GB of memory. In practice, your code's memory limit will be slightly lower.
 
 
 

@@ -1,7 +1,7 @@
 from .lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity, ExecutionError, RemoteError,
-                  FASTMAP_DOCSTRING, INIT_DOCSTRING)
+                  CLIENT_VERSION, FASTMAP_DOCSTRING, INIT_DOCSTRING)
 
-__version__ = "0.1.0"
+__version__ = CLIENT_VERSION
 
 _global_config = None
 
@@ -31,16 +31,9 @@ def fastmap(func, iterable):
         return tmp_config.fastmap(func, iterable)
 
 def _reset_global_config():
-    # For unit tests. Do not use
+    """ For unit tests. Do not use """
     global _global_config
     _global_config = None
 
 
-# @set_docstring(FASTRUN_DOCSTRING)
-# def fastrun(func, *args, **kwargs):
-#     if _global_config:
-#         _global_config.fastrun(func, *args, **kwargs)
-#     else:
-#         tmp_config = init(secret=None, exec_policy=ExecPolicy.LOCAL)
-#         tmp_config.log.warning("Fastmap not initialized. Defaulting to LOCAL exec_policy.")
-#         tmp_config.fastrun(func, *args, **kwargs)
+
