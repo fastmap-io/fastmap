@@ -10,14 +10,22 @@ if sys.version_info[:2] < (3, 7):
 with open("README.md", "r") as fh:
     long_description = fh.read()
 
+with open(os.path.join("fastmap", "lib.py")) as f:
+    version = re.search(r"^CLIENT_VERSION \= \"([0-9.]+)\"", f.read(),
+                        re.MULTILINE).group(1)
+
+with open("requirements.txt") as f:
+    requirements = map(str.strip, f.readlines())
+    requirements = list(filter(lambda l: not l.startswith("#"), requirements))
+
+
 setuptools.setup(
     name="fastmap",
-    version=re.search("^__version__.*?([0-9.]+)",
-                      open(os.path.join('fastmap', '__init__.py')).read(),
-                      re.MULTILINE).group(1),
+    version=version,
     author="fastmap.io team",
-    author_email="contact@fastmap.io",
-    description="Fastmap is a distributed drop-in replacement for `map`. It runs faster than the builtin map function in most cases >1 second. Fastmap is adaptively run both locally and the fastmap.io cloud service.",
+    author_email="scottmrogowski@gmail.com",
+    description="Fastmap is a drop-in replacement for `map` that " \
+                "parallelizes your code using both cloud and local resources.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/fastmap-io/fastmap",
@@ -28,14 +36,5 @@ setuptools.setup(
         "Operating System :: OS Independent",
     ],
     python_requires='>=3.6',
-    install_requires=[
-        "psutil>=5,<6",
-    ],
-    # extras_require={
-    #     'dev': [
-    #         "nose>=1,<2",
-    #     ]
-    # },
-    test_suite='nose.collector',
-    tests_require=['nose'],
+    install_requires=requirements,
 )

@@ -6,6 +6,7 @@ ExecPolicy = ExecPolicy
 Verbosity = Verbosity
 ExecutionError = ExecutionError
 RemoteError = RemoteError
+FastmapConfig = FastmapConfig
 
 __version__ = CLIENT_VERSION
 _global_config = None

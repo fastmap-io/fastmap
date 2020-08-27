@@ -23,7 +23,7 @@ For complete documentation, go to [https://fastmap.io/docs](https://fastmap.io/d
 ### Installation
 
 ```bash
-pip install fastmap
+python setup.py
 ```
 
 Note that in some environments, you may need to use `sudo` and/or `pip3`
@@ -74,4 +74,4 @@ No problem! You can still run fastmap without a fastmap.io account. Instead of p
 
 ### Questions
 
-Fastmap.io is a new project and I would love to hear your feedback. You can contact me directly at scott@fastmap.io.
+Fastmap.io is a new project and I would love to hear your feedback. You can contact me directly at scottmrogowski@gmail.com.
