@@ -1,22 +1,22 @@
-from .lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity, ExecutionError, RemoteError,
-                  CLIENT_VERSION, FASTMAP_DOCSTRING, INIT_DOCSTRING)
-
-__version__ = CLIENT_VERSION
-
-_global_config = None
+from .lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity,
+                  ExecutionError, RemoteError, CLIENT_VERSION, INIT_DOCSTRING,
+                  GLOBAL_INIT_DOCSTRING, FASTMAP_DOCSTRING)
 
 ExecPolicy = ExecPolicy
 Verbosity = Verbosity
 ExecutionError = ExecutionError
 RemoteError = RemoteError
 
-@set_docstring(INIT_DOCSTRING, "Initialize fastmap globally. Also see init.")
+__version__ = CLIENT_VERSION
+_global_config = None
+
+@set_docstring(GLOBAL_INIT_DOCSTRING)
 def global_init(**kwargs):
     global _global_config
     _global_config = init(**kwargs)
 
 
-@set_docstring(INIT_DOCSTRING, "Initialize a reusable FastmapConfig object. Also see global_init.")
+@set_docstring(INIT_DOCSTRING)
 def init(**kwargs):
     return FastmapConfig(**kwargs)
 
@@ -27,7 +27,8 @@ def fastmap(func, iterable):
         return _global_config.fastmap(func, iterable)
     else:
         tmp_config = init(secret=None, exec_policy=ExecPolicy.LOCAL)
-        tmp_config.log.warning("Fastmap not initialized. Defaulting to LOCAL exec_policy.")
+        tmp_config.log.warning("Fastmap not initialized globally."
+                               "Defaulting to LOCAL exec_policy.")
         return tmp_config.fastmap(func, iterable)
 
 def _reset_global_config():
