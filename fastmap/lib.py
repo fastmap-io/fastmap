@@ -183,14 +183,17 @@ def create_headers(secret, payload):
     }
 
 
-def unpickle_resp(resp, secret):
+def unpickle_resp(resp):
+    return pickle.loads(base64.b64decode(resp.content))
+
+
+def check_unpickle_resp(resp, secret):
     if 'X-Content-Signature' not in resp.headers:
         raise RemoteError("Remote payload was not signed. Will not unpickle.")
     remote_hash = hmac_digest(secret, resp.content)
     if resp.headers['X-Content-Signature'] != remote_hash:
         raise RemoteError("Remote checksum did not match. Will not unpickle.")
-    return pickle.loads(base64.b64decode(resp.content))
-
+    return unpickle_resp(resp)
 
 
 def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
@@ -210,7 +213,7 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
         raise RemoteError("Fastmap could not connect to the cloud server. "
                           "Check your connection.")
     if resp.status_code == 200:
-        resp_dict = unpickle_resp(resp, secret)
+        resp_dict = check_unpickle_resp(resp, secret)
         results = resp_dict['results']
         remote_cid = resp.headers['X-Container-Id']
         remote_tid = resp.headers['X-Thread-Id']
@@ -236,19 +239,20 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
         return
 
     if resp.status_code == 401:
-        print("Unauthorized")
         raise RemoteError("Unauthorized. Check your API token.")
-    if resp.status_code == 402:
-        raise RemoteError("Insufficient vCPU credits for this request. "
-                          "Your current balance is %.4f vCPU-seconds." %
-                          resp.json().get('vcpu_seconds', 0.0))
     if resp.status_code == 403:
         raise RemoteError("Invalid client signature. Check your API token.")
+    if resp.status_code == 402:
+        resp_out = check_unpickle_resp(resp, secret)
+        raise RemoteError("Insufficient vCPU credits for this request. "
+                          "Your current balance is %.4f vCPU-seconds." %
+                          resp_out.get('vcpu_seconds', 0.0))
     if resp.status_code == 400:
-        raise RemoteError("Your code could not be processed remotely. "
-                          "Check your code for errors.")
+        resp_out = check_unpickle_resp(resp, secret)
+        raise RemoteError("Your code could not be processed remotely.\n" +
+                          resp_out['traceback'])
     try:
-        resp_out = unpickle_resp(resp, secret)
+        resp_out = check_unpickle_resp(resp, secret)
     except pickle.UnpicklingError:
         resp_out = resp.content
     raise RemoteError("Unexpected remote error %d %r" %

@@ -1,5 +1,6 @@
 .DSStore
 __pycache__
+scratch
 htmlcov
 .coverage
 *.egg-info
