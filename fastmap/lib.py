@@ -9,6 +9,7 @@ import pickle
 import sys
 import threading
 import time
+import traceback
 
 import dill
 # import psutil
@@ -39,6 +40,8 @@ FASTMAP_DOCSTRING = """
       Both are processed lazily so fastmap will not begin execution unless
       iterated over or execution is forced (e.g. by wrapping it in a list).
 
+    For more documentation, go to https://fastmap.io/docs
+
     """
 
 INIT_PARAMS = """
@@ -53,6 +56,8 @@ INIT_PARAMS = """
         CPUs to allow other processes to remain performant. If this parameter
         is set to True, fastmap may run marginally faster.
     :param confirm_charges: Manually confirm cloud charges.
+
+    For more documentation, go to https://fastmap.io/docs
     """
 
 GLOBAL_INIT_DOCSTRING = """
@@ -122,7 +127,7 @@ def get_hash(obj):
     return hashlib.sha256(obj).hexdigest()
 
 
-class ExecutionError(Exception):
+class EveryProcessDead(Exception):
     """
     Thrown when something goes wrong running the user's code on the
     cloud or on separate processes.
@@ -132,6 +137,12 @@ class RemoteError(Exception):
     """
     Thrown when the remote connection results in a non-200
     """
+    def __init__(self, *args, **kwargs):
+        try:
+            self.tb = kwargs.pop('tb')
+        except KeyError:
+            self.tb = None
+        super(RemoteError, self).__init__(*args, **kwargs)
 
 class Namespace(dict):
     def __init__(self, *args, **kwargs):
@@ -146,7 +157,32 @@ class Namespace(dict):
 
 Verbosity = Namespace("QUIET", "NORMAL", "LOUD")
 ExecPolicy = Namespace("ADAPTIVE", "LOCAL", "CLOUD")
-Color = Namespace(GREEN="\033[92m", CANCEL="\033[0m")
+Color = Namespace(
+    GREEN="\033[92m",
+    RED="\033[91m",
+    YELLOW="\033[93m",
+    CYAN="\033[36m",
+    CANCEL="\033[0m")
+
+
+def simplified_tb(tb):
+    """
+    Given a traceback, remove fastmap-specific lines to make it easier
+    for the end user to
+    """
+    try:
+        tb_list = []
+        for tb_line in reversed(tb.split('\n')):
+            if tb_line.startswith('  File "' + os.path.abspath(__file__)):
+                tb_list.pop()
+                tb_list.append(tb.split('\n')[0])
+                break
+            tb_list.append(tb_line)
+        if len(tb_list) > 1:
+            return '\n'.join(reversed(tb_list)).strip()
+    except:
+        pass
+    return tb
 
 
 def process_local(func, itdm, log):
@@ -158,14 +194,18 @@ def process_local(func, itdm, log):
             ret = list(map(func, batch_iter))
             total_proc_time = time.perf_counter() - start
             runtime = total_proc_time / len(ret)
-            log.debug("Batch %d of size %d ran in %.2f (%.2e per element)",
+            log.debug("Local batch %d of size %d ran in %.2f (%.2e per element)",
                       batch_idx, len(ret), total_proc_time, runtime)
             itdm.push_outbox(batch_idx, ret, runtime)
             batch_tup = itdm.checkout()
     except Exception as e:
         proc_name = multiprocessing.current_process().name
         itdm.put_error(proc_name, repr(e), batch_tup)
-        raise e
+        tb = simplified_tb(traceback.format_exc())
+        log.error("In local process [%s]:\n %s",
+                  multiprocessing.current_process().name, tb)
+        return
+
 
 def hmac_digest(secret, payload):
     return hmac.new(secret[48:].encode(), payload,
@@ -225,12 +265,13 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
         app_time_per_el = total_application / len(results)
         map_time_per_el = total_mapping / len(results)
 
-        log.debug("Got %d results from %s/%s",
-                  len(results), remote_cid, remote_tid)
-        log.debug("Batch processed for %.2f/%.2f/%.2f map/app/req "
-                  "(%.2e/%.2e/%.2e per element)",
+        log.debug("Cloud batch %d of size %d ran in "
+                  "%.2f/%.2f/%.2f map/app/req (%.2e/%.2e/%.2e per element) "
+                  "[%s/%s]",
+                  batch_idx, len(results),
                   total_mapping, total_application, total_request,
-                  map_time_per_el, app_time_per_el, req_time_per_el)
+                  map_time_per_el, app_time_per_el, req_time_per_el,
+                  remote_cid, remote_tid)
         itdm.push_outbox(batch_idx,
                          results,
                          None,
@@ -249,8 +290,8 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
                           resp_out.get('vcpu_seconds', 0.0))
     if resp.status_code == 400:
         resp_out = check_unpickle_resp(resp, secret)
-        raise RemoteError("Your code could not be processed remotely.\n" +
-                          resp_out['traceback'])
+        raise RemoteError("Your code could not be processed remotely: %r" %
+                          resp_out['exception'], tb=resp_out['traceback'])
     try:
         resp_out = check_unpickle_resp(resp, secret)
     except pickle.UnpicklingError:
@@ -277,7 +318,14 @@ def remote_thread(thread_id, url, func_hash, encoded_func,
             thread_id = threading.get_ident()
             error_loc = "%s: thread:%d" % (proc_name, thread_id)
             itdm.put_error(error_loc, repr(e), batch_tup)
-            raise e
+            if e.tb:
+                log.error("In remote process [%s]:\n%s",
+                          threading.current_thread().name, e.tb)
+            else:
+                log.error("In remote process [%s]: %r",
+                          threading.current_thread().name, e)
+            return
+
         batch_tup = itdm.checkout()
 
 
@@ -296,8 +344,8 @@ class _RemoteProcessor(multiprocessing.Process):
         self.cloud_url_base = config.cloud_url_base
         self.secret = config.secret
         self.process_name = multiprocessing.current_process().name
-        self.log.info("Initialized remote processor. Func payload is %dB",
-                      len(self.encoded_func))
+        self.log.debug("Initialized remote processor. Func payload is %dB",
+                       len(self.encoded_func))
 
     def start(self):
         # TODO did I want to use this for something?
@@ -318,9 +366,11 @@ class _RemoteProcessor(multiprocessing.Process):
             process_remote_batch(self.itdm, batch_tup, url, req_dict,
                                  self.secret, self.log)
         except Exception as e:
-            print("except", e)
             self.itdm.put_error(self.process_name, repr(e), batch_tup)
-            print("except here")
+            if e.tb:
+                self.log.error("In remote process manager [%s]:\n%s", multiprocessing.current_process().name, e.tb)
+            else:
+                self.log.error("In remote process manager [%s]: %r", multiprocessing.current_process().name, e)
             return
 
         self.log.debug("Opening %d remote connection(s)",
@@ -343,9 +393,7 @@ class InterThreadDataManager():
     def __init__(self, iterable, first_runtime, max_batches_in_queue):
         manager = multiprocessing.Manager()
         self._lock = multiprocessing.Lock()
-        self._get_lock = multiprocessing.Lock()
-        self._inbox = multiprocessing.Queue()
-        self._retry = multiprocessing.Queue()
+        self._inbox = manager.list()
         self._outbox = manager.list()
         self._runtimes = manager.list()
         self._errors = multiprocessing.Queue()
@@ -358,12 +406,12 @@ class InterThreadDataManager():
         self.state['total_vcpu_seconds'] = 0.0
         self.state['total_network_seconds'] = 0.0
 
-        self.batch_goal_time = 1.0
-
     def has_more_batches(self):
         if not self.state['inbox_capped']:
             return True
-        return self.state['in_minus_out'] > 0
+        if self.state['in_minus_out'] > 0:
+            return True
+        return len(self._outbox) > 0
 
     def get_total_vcpu_seconds(self):
         return self.state['total_vcpu_seconds']
@@ -375,24 +423,18 @@ class InterThreadDataManager():
         return self._errors.get_nowait()
 
     def put_error(self, error_loc, error_str, batch_tup):
-        # TODO, this is blocking because of some fundamental size constraints
-        # https://bugs.python.org/issue8237
-        # Why does _inbox not block (or does it?)
-        # Write more tests with very large objects.
-        self._errors.put((error_loc, error_str, batch_tup[1][:25000]))
-        # self._retry.put(batch_tup)
-        # self._inbox.put(batch_tup)
+        self._errors.put((error_loc, error_str))
+        with self._lock:
+            self._inbox.insert(0, batch_tup)
+        pass
 
     def kill(self):
         with self._lock:
             self.state['inbox_capped'] = True
-            try:
-                while True:
-                    self._inbox.get_nowait()
-            except multiprocessing.queues.Empty:
-                pass
+            self._inbox = None
             self._outbox = None
             self._runtimes = None
+
 
     def mark_inbox_capped(self):
         with self._lock:
@@ -400,8 +442,8 @@ class InterThreadDataManager():
             self.state['inbox_capped'] = True
 
     def push_inbox(self, item):
-        self._inbox.put(item)
         with self._lock:
+            self._inbox.append(item)
             self.state['in_minus_out'] += 1
 
     def total_avg_runtime(self):
@@ -410,24 +452,25 @@ class InterThreadDataManager():
     def checkout(self):
         # Repeatedly try popping an item off the inbox.
         # If not capped, keep trying.
-        try:
-            return self._retry.get_nowait()
-        except multiprocessing.queues.Empty:
-            pass
 
         while True:
             if self.state['inbox_capped']:
                 # If capped, assume that if we don't get an item from the inbox
                 # that means we are exhausted and send the poison pill
+                with self._lock:
+                    try:
+                        return self._inbox.pop(0)
+                    except IndexError:
+                        return None
+
+            with self._lock:
                 try:
-                    return self._inbox.get_nowait()
-                except multiprocessing.queues.Empty:
-                    return None
-            try:
-                ret = self._inbox.get(timeout=.01)
-                return ret
-            except multiprocessing.queues.Empty:
-                pass
+                    ret = self._inbox.pop(0)
+                    return ret
+                except IndexError:
+                    pass
+            time.sleep(.01)
+
 
     def push_outbox(self, item_idx, result, runtime,
                     vcpu_seconds=None, network_seconds=None):
@@ -440,25 +483,20 @@ class InterThreadDataManager():
                 self.state['total_vcpu_seconds'] += vcpu_seconds
             if network_seconds:
                 self.state['total_network_seconds'] += network_seconds
-            # del self._loans[item_idx]
 
     def pop_outbox(self, processors):
-        print("popping", processors)
         while True:
             with self._lock:
                 if len(self._outbox):
                     return self._outbox.pop(0)
             if not any(p.is_alive() for p in processors):
-                raise ExecutionError("Every execution process died.")
+                raise EveryProcessDead()
             time.sleep(.01)
-            # print("pop true", processors)
 
-    # def reprocess_loans(self):
-    #     with self._lock:
-    #         self._inbox = sorted(self._loans.items()) + self._inbox
-    #         # self._loans = {}
 
 class _FillInbox(threading.Thread):
+    BATCH_DUR_GOAL = .2
+
     def __init__(self, iterable, itdm, log, avg_runtime, *args, **kwargs):
         self.iterable = iterable
         self.itdm = itdm
@@ -473,7 +511,7 @@ class _FillInbox(threading.Thread):
         self.do_die = True
 
     def batch_len(self):
-        return max(1, int(.2 / self.avg_runtime))
+        return max(1, int(self.BATCH_DUR_GOAL / self.avg_runtime))
 
 
 class FillInboxWithGen(_FillInbox):
@@ -536,19 +574,19 @@ class FastmapLogger():
 
     def debug(self, msg, *args):
         msg = msg % args
-        print("fastmap DEBUG:", msg)
+        print(Color.CYAN + "fastmap DEBUG:" + Color.CANCEL, msg)
 
     def info(self, msg, *args):
         msg = msg % args
-        print("fastmap INFO:", msg)
+        print(Color.YELLOW + "fastmap INFO:" + Color.CANCEL, msg)
 
     def warning(self, msg, *args):
         msg = msg % args
-        print("fastmap WARNING:", msg)
+        print(Color.RED + "fastmap WARNING:" + Color.CANCEL, msg)
 
     def error(self, msg, *args):
         msg = msg % args
-        print("fastmap ERROR:", msg)
+        print(Color.RED + "fastmap ERROR:" + Color.CANCEL, msg)
 
     def input(self, msg):
         # This exists mostly for test mocking
@@ -620,6 +658,7 @@ class FastmapConfig():
         start_time = time.perf_counter()
         mapper = Mapper(self)
         is_seq = hasattr(iterable, '__len__')
+        errors = []
 
         try:
             if self.verbosity == Verbosity.QUIET:
@@ -658,21 +697,21 @@ class FastmapConfig():
                 try:
                     while True:
                         process_error = mapper.itdm.get_error()
-                        self.log.error(" Process error [%s]: %s",
-                                       process_error[0], process_error[1])
+                        errors.append(" Process error [%s]: %s" % (
+                                      process_error[0], process_error[1]))
                 except multiprocessing.queues.Empty:
                     pass
-
-                try:
-                    while True:
-                        process_error = mapper.itdm._retry.get_nowait()
-                        self.log.error(" batchtup TODO remove [%s]: %s",
-                                       process_error[0], process_error[1])
-                except multiprocessing.queues.Empty:
-                    pass
-
             mapper.cleanup()
-            raise e
+
+            if not errors or not isinstance(e, EveryProcessDead):
+                raise e
+
+        if errors:
+            error_msg = "Every execution process died. List of errors:"
+            for error in errors:
+                error_msg += "\n  " + error
+            self.log.error(error_msg)
+            raise EveryProcessDead()
 
         total_duration = time.perf_counter() - start_time
         self._log_final_stats(mapper, num_processed, total_duration)
@@ -808,10 +847,11 @@ class Mapper():
                 remote_proc = _RemoteProcessor(func, itdm, self.config)
                 remote_proc.start()
                 processors.append(remote_proc)
+        print("we have %d processors" % len(processors))
 
         if not processors or not any(p.is_alive() for p in processors):
-            raise ExecutionError("No execution processes started. " \
-                                 "Try modifying your fastmap configuration.")
+            raise EveryProcessDead("No execution processes started. "
+                                   "Try modifying your fastmap configuration.")
 
         return processors, itdm
 
@@ -892,7 +932,6 @@ class Mapper():
 
         cur_idx = 0
         staging = {}
-        print("here?")
         while self.itdm.has_more_batches():
             result_idx, result_list = self.itdm.pop_outbox(self.processors)
             staging[result_idx] = result_list
@@ -900,7 +939,7 @@ class Mapper():
                 yield staging.pop(cur_idx)
                 cur_idx += 1
 
-        self.log.debug("Cleaning up threads and processes...")
+        # self.log.debug("Cleaning up threads and processes...")
         self.fill_inbox_thread.join()
         for processor in self.processors:
             processor.join()

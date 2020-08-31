@@ -11,7 +11,8 @@ import pytest
 
 sys.path.append(os.getcwd().split('/test')[0])
 
-from fastmap import init, global_init, fastmap, _reset_global_config, ExecutionError, lib
+from fastmap import (init, global_init, fastmap, _reset_global_config,
+                     EveryProcessDead, lib, FastmapConfig)
 # from fastmap.lib import FastmapConfig
 
 FAKE_SECRET = "FAKE_SECRET_OF_LEN_96_FAKE_SECRET_OF_LEN_96_FAKE_SECRET_OF_" \
@@ -149,7 +150,7 @@ def test_process_exception(capsys, monkeypatch):
     config = init(exec_policy="LOCAL")
     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
-    with pytest.raises(ExecutionError):
+    with pytest.raises(EveryProcessDead):
         list(config.fastmap(calc_pi_dead_99, range(100)))
 
 
@@ -163,6 +164,15 @@ def test_process_adaptive(capsys, monkeypatch):
     assert pi == 3.12
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, iter(range_100))) / len(range_100)
     assert pi == 3.12
+
+def test_order(monkeypatch):
+    config = init(exec_policy="LOCAL")
+    monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
+    monkeypatch.setattr(lib._FillInbox, "BATCH_DUR_GOAL", .0001)
+    order_range = list(config.fastmap(lambda x: int((x**2)**.5), range(10000)))
+    assert order_range == list(range(10000))
+
 
 
 def test_no_secret(monkeypatch, capsys):
@@ -183,27 +193,38 @@ def test_remote_no_connection(monkeypatch, capsys):
     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
     range_100 = range(100)
-    with pytest.raises(ExecutionError):
+    with pytest.raises(EveryProcessDead):
         list(config.fastmap(lambda x: x**.5, range_100))
     stdio = capsys.readouterr()
-    assert re.search("fastmap ERROR:.*?could not connect", stdio.out)
+    assert re.search("could not connect", stdio.out)
 
 def test_confirm_charges_basic(capsys, monkeypatch):
-    init(exec_policy="LOCAL")
+    # Basic local should not warn about confirming charges or any issues with
+    # the secret
+    config = init(exec_policy="LOCAL")
     stdio = capsys.readouterr()
     assert not re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert not re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
+    assert isinstance(config, FastmapConfig)
+    assert config.exec_policy == "LOCAL"
 
-    init(exec_policy="CLOUD")
+    # Basic cloud should warn about an absent secret and set execpolicy to local
+    # (and say something about it)
+    config = init(exec_policy="CLOUD")
     stdio = capsys.readouterr()
     assert not re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
+    assert config.exec_policy == "LOCAL"
 
-    init(exec_policy="CLOUD", secret=FAKE_SECRET)
+    # If a secret is correctly provided for cloud, warn about confirming
+    # charges and do not set to local config policy
+    config = init(exec_policy="CLOUD", secret=FAKE_SECRET)
     stdio = capsys.readouterr()
     assert re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert not re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
+    assert config.exec_policy == "CLOUD"
 
+    # If we set confirm charges, assert no warnings are thrown
     config = init(exec_policy="CLOUD", secret=FAKE_SECRET, confirm_charges=True)
     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
@@ -211,14 +232,18 @@ def test_confirm_charges_basic(capsys, monkeypatch):
     stdio = capsys.readouterr()
     assert not re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert not re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
+    assert config.exec_policy == "CLOUD"
+    assert config.confirm_charges == True
 
+    # Using the same config, ensure that every process dies with a fake url.
+    # There should only be 1 process which can die
     config.cloud_url_base = "http://localhost:9999"
-    with pytest.raises(ExecutionError):
+    with pytest.raises(EveryProcessDead):
         list(config.fastmap(lambda x: x**.5, range(100)))
     stdio = capsys.readouterr()
     assert re.search(r"Continue\?", stdio.out)
 
-    with pytest.raises(ExecutionError):
+    with pytest.raises(EveryProcessDead):
         list(config.fastmap(lambda x: x**.5, iter(range(100))))
     stdio = capsys.readouterr()
     assert re.search(r"Continue anyway\?", stdio.out)
@@ -231,7 +256,7 @@ def test_confirm_charges_basic(capsys, monkeypatch):
     assert re.search(r"fastmap INFO:.*?cancelled", stdio.out)
 
     # monkeypatch.setattr(lib.FastmapLogger, "input", fake_input_try_again)
-    # with pytest.raises(ExecutionError):
+    # with pytest.raises(EveryProcessDead):
     #     list(config.fastmap(lambda x: x**.5, iter(range(100))))
     # stdio = capsys.readouterr()
     # assert re.search(r"Unrecognized", stdio.out)
@@ -283,7 +308,7 @@ def resp_headers():
 #     config = init(exec_policy="CLOUD", secret=FAKE_SECRET)
 #     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
 #     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
-#     with pytest.raises(ExecutionError):
+#     with pytest.raises(EveryProcessDead):
 #         # Unauthorized will kill the cloud thread
 #         list(config.fastmap(lambda x: x**.5, range(100)))
 #     stdio = capsys.readouterr()
@@ -300,7 +325,7 @@ def resp_headers():
 #     config = init(exec_policy="CLOUD", secret=FAKE_SECRET)
 #     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
 #     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
-#     with pytest.raises(ExecutionError):
+#     with pytest.raises(EveryProcessDead):
 #         # Unauthorized will kill the cloud thread
 #         list(config.fastmap(lambda x: x**.5, range(100)))
 #     stdio = capsys.readouterr()
