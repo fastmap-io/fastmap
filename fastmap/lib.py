@@ -3,6 +3,7 @@ import gzip
 import hashlib
 import hmac
 import itertools
+import json
 import multiprocessing
 import os
 import pickle
@@ -12,7 +13,7 @@ import time
 import traceback
 
 import dill
-# import psutil
+import psutil
 import requests
 
 CLIENT_VERSION = "0.0.1"
@@ -24,8 +25,8 @@ FASTMAP_DOCSTRING = """
     multiprocessing, in the cloud on the fastmap.io servers, or adaptively on
     both.
 
-    :param func: Function to map against.
-    :param iterable: Iterable to map over.
+    :param function func: Function to map against.
+    :param sequence|generator iterable: Iterable to map over.
     :rtype: Generator
 
     Fastmap is a parallelized/distributed drop-in replacement for 'map'.
@@ -45,17 +46,16 @@ FASTMAP_DOCSTRING = """
     """
 
 INIT_PARAMS = """
-    :param secret: The API token generated on fastmap.io. Treat this like a
+    :param str secret: The API token generated on fastmap.io. Treat this like a
         password. Do not commit it to version control! Failure to do so could
         result in man-in-the-middle attacks or your credits being used by others
         (e.g. cryptocurrency miners). If None, fastmap will run locally
         regardless of exec_policy.
-    :param verbosity: 'QUIET', 'NORMAL', or 'LOUD'. Default is 'NORMAL'.
-    :param exec_policy: 'LOCAL', 'CLOUD', or 'ADAPTIVE'. Default is 'ADAPTIVE'.
-    :param all_local_cpus: By default, fastmap will not utilize all available
-        CPUs to allow other processes to remain performant. If this parameter
-        is set to True, fastmap may run marginally faster.
-    :param confirm_charges: Manually confirm cloud charges.
+    :param str verbosity: 'QUIET', 'NORMAL', or 'LOUD'. Default is 'NORMAL'.
+    :param str exec_policy: 'LOCAL', 'CLOUD', or 'ADAPTIVE'. Default is 'ADAPTIVE'.
+    :param int local_processes: How many local processes to start. By default,
+        fastmap will start a maximum of num_cores * 2 - 2.
+    :param bool confirm_charges: Manually confirm cloud charges.
 
     For more documentation, go to https://fastmap.io/docs
     """
@@ -229,10 +229,11 @@ def unpickle_resp(resp):
 
 def check_unpickle_resp(resp, secret):
     if 'X-Content-Signature' not in resp.headers:
-        raise RemoteError("Remote payload was not signed. Will not unpickle.")
+        raise RemoteError("Cloud payload was not signed (%d). "
+                          "Will not unpickle." % (resp.status_code))
     remote_hash = hmac_digest(secret, resp.content)
     if resp.headers['X-Content-Signature'] != remote_hash:
-        raise RemoteError("Remote checksum did not match. Will not unpickle.")
+        raise RemoteError("Cloud checksum did not match. Will not unpickle.")
     return unpickle_resp(resp)
 
 
@@ -294,8 +295,12 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
                           resp_out['exception'], tb=resp_out['traceback'])
     try:
         resp_out = check_unpickle_resp(resp, secret)
-    except pickle.UnpicklingError:
-        resp_out = resp.content
+    except (RemoteError, pickle.UnpicklingError):
+        try:
+            resp_out = json.loads(resp.content)
+        except:
+            resp_out = resp.content
+
     raise RemoteError("Unexpected remote error %d %r" %
                       (resp.status_code, resp_out))
 
@@ -344,8 +349,8 @@ class _RemoteProcessor(multiprocessing.Process):
         self.cloud_url_base = config.cloud_url_base
         self.secret = config.secret
         self.process_name = multiprocessing.current_process().name
-        self.log.debug("Initialized remote processor. Func payload is %dB",
-                       len(self.encoded_func))
+        self.log.debug("Initialized cloud processor at %r. Func payload is %dB",
+                       self.cloud_url_base, len(self.encoded_func))
 
     def start(self):
         # TODO did I want to use this for something?
@@ -573,19 +578,31 @@ class FastmapLogger():
             raise AssertionError(f"Unknown value for verbosity '{verbosity}'")
 
     def debug(self, msg, *args):
-        msg = msg % args
+        try:
+            msg = msg % args
+        except TypeError:
+            pass
         print(Color.CYAN + "fastmap DEBUG:" + Color.CANCEL, msg)
 
     def info(self, msg, *args):
-        msg = msg % args
+        try:
+            msg = msg % args
+        except TypeError:
+            pass
         print(Color.YELLOW + "fastmap INFO:" + Color.CANCEL, msg)
 
     def warning(self, msg, *args):
-        msg = msg % args
+        try:
+            msg = msg % args
+        except TypeError:
+            pass
         print(Color.RED + "fastmap WARNING:" + Color.CANCEL, msg)
 
     def error(self, msg, *args):
-        msg = msg % args
+        try:
+            msg = msg % args
+        except TypeError:
+            pass
         print(Color.RED + "fastmap ERROR:" + Color.CANCEL, msg)
 
     def input(self, msg):
@@ -609,21 +626,20 @@ class FastmapConfig():
         "log",
         "exec_policy",
         "confirm_charges",
-        "num_local_procs",
+        "local_processes",
         "max_cloud_connections",
         "cloud_url_base",
     ]
 
     def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
                  exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
-                 all_local_cpus=False):
+                 local_processes=None):
         if exec_policy not in ExecPolicy:
             raise AssertionError(f"Unknown exec_policy '{exec_policy}'")
         self.exec_policy = exec_policy
         self.log = FastmapLogger(verbosity)
         self.verbosity = verbosity
         self.confirm_charges = confirm_charges
-        self.num_local_procs = os.cpu_count()
         self.cloud_url_base = CLOUD_URL_BASE
         self.max_cloud_connections = 3
 
@@ -637,12 +653,14 @@ class FastmapConfig():
                 self.log.warning("No secret provided. "
                                  "Setting exec_policy to LOCAL.")
 
-        # try:
-        #     self.num_local_procs = len(psutil.Process().cpu_affinity())
-        # except AttributeError:
-        #     self.num_local_procs = psutil.cpu_count()
-        if not all_local_cpus:
-            self.num_local_procs -= 2
+        if local_processes:
+            self.local_processes = local_processes
+        else:
+            try:
+                self.local_processes = len(psutil.Process().cpu_affinity())
+            except AttributeError:
+                self.local_processes = psutil.cpu_count()
+            self.local_processes -= 2
 
         if not confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
             self.log.warning("The parameter 'confirm_charges' is False. Your "
@@ -824,9 +842,9 @@ class Mapper():
         if self.config.exec_policy == ExecPolicy.CLOUD:
             max_batches_in_queue = self.config.max_cloud_connections
         elif self.config.exec_policy == ExecPolicy.LOCAL:
-            max_batches_in_queue = self.config.num_local_procs
+            max_batches_in_queue = self.config.local_processes
         else:
-            max_batches_in_queue = self.config.num_local_procs + \
+            max_batches_in_queue = self.config.local_processes + \
                                    self.config.max_cloud_connections
 
         itdm = InterThreadDataManager(iterable, self.avg_runtime,
@@ -834,14 +852,14 @@ class Mapper():
 
         processors = []
         if self.config.exec_policy != ExecPolicy.CLOUD:
-            for _ in range(self.config.num_local_procs):
+            for _ in range(self.config.local_processes):
                 proc_args = (func, itdm, self.log)
                 local_proc = multiprocessing.Process(target=process_local,
                                                      args=proc_args)
                 local_proc.start()
                 processors.append(local_proc)
             self.log.debug("Launching %d local processes",
-                           self.config.num_local_procs)
+                           self.config.local_processes)
         if self.config.exec_policy != ExecPolicy.LOCAL:
             if self._confirm_charges(iterable):
                 remote_proc = _RemoteProcessor(func, itdm, self.config)
@@ -890,8 +908,8 @@ class Mapper():
 
     def _estimate_multiproc_runtime(self, iterable):
         local_runtime = self.avg_runtime * len(iterable)
-        total_proc_overhead = self.config.num_local_procs * self.PROC_OVERHEAD
-        total_process_runtime = local_runtime / self.config.num_local_procs
+        total_proc_overhead = self.config.local_processes * self.PROC_OVERHEAD
+        total_process_runtime = local_runtime / self.config.local_processes
         return total_proc_overhead + total_process_runtime
 
 
