@@ -112,7 +112,7 @@ def fmt_bytes(num_bytes):
         return "%.1fMB" % (num_bytes / 1024**2)
     if num_bytes >= 1024:
         return "%.1fKB" % (num_bytes / 1024)
-    return "%dB" % num_bytes
+    return "%.1fB" % num_bytes
 
 def fmt_time(num_secs):
     hours, remainder = divmod(num_secs, 3600)
@@ -194,7 +194,7 @@ def process_local(func, itdm, log):
             ret = list(map(func, batch_iter))
             total_proc_time = time.perf_counter() - start
             runtime = total_proc_time / len(ret)
-            log.debug("Local batch %d of size %d ran in %.2f (%.2e per element)",
+            log.debug("Batch %d local cnt=%d dur=%.2fs (%.2e per el)",
                       batch_idx, len(ret), total_proc_time, runtime)
             itdm.push_outbox(batch_idx, ret, runtime)
             batch_tup = itdm.checkout()
@@ -246,8 +246,9 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
     encoded = base64.b64encode(pickled)
     payload = gzip.compress(encoded, compresslevel=1)
     headers = create_headers(secret, payload)
-    log.debug("Making cloud request with %d elements. %s. %.2fB / element ",
-              len(batch), fmt_bytes(len(payload)), len(payload) / len(batch))
+    log.debug("Making cloud request len=%d payload=%s (%s per el)",
+              len(batch), fmt_bytes(len(payload)),
+              fmt_bytes(len(payload) / len(batch)))
     try:
         resp = requests.post(url, data=payload, headers=headers)
     except requests.exceptions.ConnectionError:
@@ -266,8 +267,8 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
         app_time_per_el = total_application / len(results)
         map_time_per_el = total_mapping / len(results)
 
-        log.debug("Cloud batch %d of size %d ran in "
-                  "%.2f/%.2f/%.2f map/app/req (%.2e/%.2e/%.2e per element) "
+        log.debug("Batch %d cloud cnt=%d "
+                  "%.2fs/%.2fs/%.2fs map/app/req (%.2e/%.2e/%.2e per el) "
                   "[%s/%s]",
                   batch_idx, len(results),
                   total_mapping, total_application, total_request,
@@ -737,7 +738,6 @@ class FastmapConfig():
     def _log_final_stats(self, mapper, num_processed, total_duration):
 
         avg_runtime = mapper.avg_runtime
-        total_network_seconds = mapper.total_network_seconds
         total_vcpu_seconds = mapper.total_vcpu_seconds
 
         print()
@@ -769,12 +769,10 @@ class FastmapConfig():
             else:
                 self.log.info("Processed %d elements in %.2fs. "
                               "This ran slower than the map builtin by %.2fs "
-                              "(estimate). Network transfer accounts for %.2fs "
-                              "of this duration. Consider upgrading your "
+                              "(estimate). Consider upgrading your "
                               "connection, reducing your data size, or using "
                               "exec_policy LOCAL or ADAPTIVE.",
-                              num_processed, total_duration, time_saved * -1,
-                              total_network_seconds)
+                              num_processed, total_duration, time_saved * -1)
 
         if total_vcpu_seconds:
             self.log.info("Used %.4f vCPU-hours.", total_vcpu_seconds/60/60)
@@ -800,7 +798,7 @@ class Mapper():
         self.itdm = None
 
     def cleanup(self):
-        self.log.error("Cleaning up threads and processes because of error...")
+        self.log.info("Cleaning up threads and processes because of error...")
         for p in self.processors:
             p.join()
         if self.fill_inbox_thread:
@@ -810,7 +808,7 @@ class Mapper():
                 self.fill_inbox_thread.join()
         if self.itdm:
             self.itdm.kill()
-        self.log.error("Threads and processes clean.")
+        self.log.info("Threads and processes clean.")
 
     def _confirm_charges(self, iterable):
         if not self.config.confirm_charges:
