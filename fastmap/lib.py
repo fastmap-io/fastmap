@@ -223,18 +223,24 @@ def create_headers(secret, payload):
     }
 
 
-def unpickle_resp(resp):
-    return pickle.loads(base64.b64decode(resp.content))
 
 
-def check_unpickle_resp(resp, secret):
-    if 'X-Content-Signature' not in resp.headers:
-        raise RemoteError("Cloud payload was not signed (%d). "
-                          "Will not unpickle." % (resp.status_code))
-    remote_hash = hmac_digest(secret, resp.content)
-    if resp.headers['X-Content-Signature'] != remote_hash:
-        raise RemoteError("Cloud checksum did not match. Will not unpickle.")
-    return unpickle_resp(resp)
+def check_unpickle_resp(resp, secret, maybe_json=False):
+    try:
+        if 'X-Content-Signature' not in resp.headers:
+            raise RemoteError("Cloud payload was not signed (%d). "
+                              "Will not unpickle." % (resp.status_code))
+        remote_hash = hmac_digest(secret, resp.content)
+        if resp.headers['X-Content-Signature'] != remote_hash:
+            raise RemoteError("Cloud checksum did not match. Will not unpickle.")
+        return pickle.loads(base64.b64decode(resp.content))
+    except (RemoteError, pickle.UnpicklingError) as e:
+        if maybe_json:
+            try:
+                return json.loads(resp.content)
+            except json.JSONDecodeError:
+                pass
+        raise e
 
 
 def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
@@ -259,6 +265,8 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
         results = resp_dict['results']
         remote_cid = resp.headers['X-Container-Id']
         remote_tid = resp.headers['X-Thread-Id']
+        if 'X-Server-Warning' in resp.headers:
+            log.warning(resp.headers['X-Server-Warning'])
 
         total_request = time.perf_counter() - start_req_time
         total_application = float(resp.headers['X-Total-Seconds'])
@@ -288,20 +296,21 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
     if resp.status_code == 402:
         resp_out = check_unpickle_resp(resp, secret)
         raise RemoteError("Insufficient vCPU credits for this request. "
-                          "Your current balance is %.4f vCPU-seconds." %
-                          resp_out.get('vcpu_seconds', 0.0))
+                          "Your current balance is %d vCPU-seconds." %
+                          resp_out.get('vcpu_seconds', 0))
     if resp.status_code == 400:
         resp_out = check_unpickle_resp(resp, secret)
         raise RemoteError("Your code could not be processed remotely: %r" %
                           resp_out['exception'], tb=resp_out['traceback'])
-    try:
-        resp_out = check_unpickle_resp(resp, secret)
-    except (RemoteError, pickle.UnpicklingError):
-        try:
-            resp_out = json.loads(resp.content)
-        except:
-            resp_out = resp.content
+    if resp.status_code == 410:
+        resp_out = check_unpickle_resp(resp, secret, maybe_json=True)
+        raise RemoteError("Fastmap.io error: %r" % resp_out['message'])
 
+    # catch all
+    try:
+        resp_out = check_unpickle_resp(resp, secret, maybe_json=True)
+    except (RemoteError, pickle.UnpicklingError):
+        resp_out = resp.content
     raise RemoteError("Unexpected remote error %d %r" %
                       (resp.status_code, resp_out))
 
@@ -409,7 +418,7 @@ class InterThreadDataManager():
         self.state = manager.dict()
         self.state['inbox_capped'] = False
         self.state['in_minus_out'] = 0
-        self.state['total_vcpu_seconds'] = 0.0
+        self.state['total_vcpu_seconds'] = 0
         self.state['total_network_seconds'] = 0.0
 
     def has_more_batches(self):
@@ -665,7 +674,7 @@ class FastmapConfig():
 
         if not confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
             self.log.warning("The parameter 'confirm_charges' is False. Your "
-                             "vCPU-hour balance will be automatically debited "
+                             "vCPU credit balance will be automatically debited "
                              "for use.")
 
         self.log.debug("Setup fastmap")
@@ -775,7 +784,10 @@ class FastmapConfig():
                               num_processed, total_duration, time_saved * -1)
 
         if total_vcpu_seconds:
-            self.log.info("Used %.4f vCPU-hours.", total_vcpu_seconds/60/60)
+            if total_vcpu_seconds <= 120:
+                self.log.info("Used %d vCPU-seconds.", total_vcpu_seconds)
+            else:
+                self.log.info("Used %.3f vCPU-hours.", total_vcpu_seconds/60.0/60.0)
 
 
 class Mapper():
