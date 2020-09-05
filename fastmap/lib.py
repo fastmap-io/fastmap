@@ -1,4 +1,5 @@
 import base64
+import distutils.sysconfig
 import gzip
 import hashlib
 import hmac
@@ -7,6 +8,7 @@ import json
 import multiprocessing
 import os
 import pickle
+import re
 import sys
 import threading
 import time
@@ -133,16 +135,16 @@ class EveryProcessDead(Exception):
     cloud or on separate processes.
     """
 
-class RemoteError(Exception):
+class CloudError(Exception):
     """
-    Thrown when the remote connection results in a non-200
+    Thrown when the cloud connection results in a non-200
     """
     def __init__(self, *args, **kwargs):
         try:
             self.tb = kwargs.pop('tb')
         except KeyError:
             self.tb = None
-        super(RemoteError, self).__init__(*args, **kwargs)
+        super(CloudError, self).__init__(*args, **kwargs)
 
 class Namespace(dict):
     def __init__(self, *args, **kwargs):
@@ -228,13 +230,13 @@ def create_headers(secret, payload):
 def check_unpickle_resp(resp, secret, maybe_json=False):
     try:
         if 'X-Content-Signature' not in resp.headers:
-            raise RemoteError("Cloud payload was not signed (%d). "
+            raise CloudError("Cloud payload was not signed (%d). "
                               "Will not unpickle." % (resp.status_code))
-        remote_hash = hmac_digest(secret, resp.content)
-        if resp.headers['X-Content-Signature'] != remote_hash:
-            raise RemoteError("Cloud checksum did not match. Will not unpickle.")
+        cloud_hash = hmac_digest(secret, resp.content)
+        if resp.headers['X-Content-Signature'] != cloud_hash:
+            raise CloudError("Cloud checksum did not match. Will not unpickle.")
         return pickle.loads(base64.b64decode(resp.content))
-    except (RemoteError, pickle.UnpicklingError) as e:
+    except (CloudError, pickle.UnpicklingError) as e:
         if maybe_json:
             try:
                 return json.loads(resp.content)
@@ -243,7 +245,7 @@ def check_unpickle_resp(resp, secret, maybe_json=False):
         raise e
 
 
-def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
+def process_cloud_batch(itdm, batch_tup, url, req_dict, secret, log):
     start_req_time = time.perf_counter()
 
     batch_idx, batch = batch_tup
@@ -258,13 +260,13 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
     try:
         resp = requests.post(url, data=payload, headers=headers)
     except requests.exceptions.ConnectionError:
-        raise RemoteError("Fastmap could not connect to the cloud server. "
+        raise CloudError("Fastmap could not connect to the cloud server. "
                           "Check your connection.")
     if resp.status_code == 200:
         resp_dict = check_unpickle_resp(resp, secret)
         results = resp_dict['results']
-        remote_cid = resp.headers['X-Container-Id']
-        remote_tid = resp.headers['X-Thread-Id']
+        cloud_cid = resp.headers['X-Container-Id']
+        cloud_tid = resp.headers['X-Thread-Id']
         if 'X-Server-Warning' in resp.headers:
             log.warning(resp.headers['X-Server-Warning'])
 
@@ -281,7 +283,7 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
                   batch_idx, len(results),
                   total_mapping, total_application, total_request,
                   map_time_per_el, app_time_per_el, req_time_per_el,
-                  remote_cid, remote_tid)
+                  cloud_cid, cloud_tid)
         itdm.push_outbox(batch_idx,
                          results,
                          None,
@@ -290,69 +292,106 @@ def process_remote_batch(itdm, batch_tup, url, req_dict, secret, log):
         return
 
     if resp.status_code == 401:
-        raise RemoteError("Unauthorized. Check your API token.")
+        raise CloudError("Unauthorized. Check your API token.")
     if resp.status_code == 403:
-        raise RemoteError("Invalid client signature. Check your API token.")
+        raise CloudError("Invalid client signature. Check your API token.")
     if resp.status_code == 402:
         resp_out = check_unpickle_resp(resp, secret)
-        raise RemoteError("Insufficient vCPU credits for this request. "
+        raise CloudError("Insufficient vCPU credits for this request. "
                           "Your current balance is %d vCPU-seconds." %
                           resp_out.get('vcpu_seconds', 0))
     if resp.status_code == 400:
         resp_out = check_unpickle_resp(resp, secret)
-        raise RemoteError("Your code could not be processed remotely: %r" %
+        raise CloudError("Your code could not be processed on the cloud: %r" %
                           resp_out['exception'], tb=resp_out['traceback'])
     if resp.status_code == 410:
         resp_out = check_unpickle_resp(resp, secret, maybe_json=True)
-        raise RemoteError("Fastmap.io error: %r" % resp_out['message'])
+        raise CloudError("Fastmap.io error: %r" % resp_out['message'])
 
     # catch all
     try:
         resp_out = check_unpickle_resp(resp, secret, maybe_json=True)
-    except (RemoteError, pickle.UnpicklingError):
+    except (CloudError, pickle.UnpicklingError):
         resp_out = resp.content
-    raise RemoteError("Unexpected remote error %d %r" %
+    raise CloudError("Unexpected cloud error %d %r" %
                       (resp.status_code, resp_out))
 
 
 
-def remote_thread(thread_id, url, func_hash, encoded_func,
+def cloud_thread(thread_id, url, req_dict,
                              itdm, secret, log):
 
     batch_tup = itdm.checkout()
-    req_dict = {
-        'func': encoded_func,
-        'func_hash': func_hash,
-    }
 
     while batch_tup:
         try:
-            process_remote_batch(itdm, batch_tup, url, req_dict, secret, log)
+            process_cloud_batch(itdm, batch_tup, url, req_dict, secret, log)
         except Exception as e:
             proc_name = multiprocessing.current_process().name
             thread_id = threading.get_ident()
             error_loc = "%s: thread:%d" % (proc_name, thread_id)
             itdm.put_error(error_loc, repr(e), batch_tup)
             if e.tb:
-                log.error("In remote process [%s]:\n%s",
+                log.error("In cloud process [%s]:\n%s",
                           threading.current_thread().name, e.tb)
             else:
-                log.error("In remote process [%s]: %r",
+                log.error("In cloud process [%s]: %r",
                           threading.current_thread().name, e)
             return
 
         batch_tup = itdm.checkout()
 
+def get_module_source():
+    site_packages_re = re.compile(r"\/python[0-9.]+\/(?:site|dist)\-packages\/")
+    std_lib_dir = distutils.sysconfig.get_python_lib(standard_lib=True)
+    module_source = {}
+    for mod_name, mod in sys.modules.items():
+        if (mod_name in sys.builtin_module_names or \
+            mod_name.startswith("_") or \
+            not getattr(mod, '__file__', None) or \
+            mod.__file__.startswith(std_lib_dir) or \
+            not mod.__file__.endswith('.py') or \
+            site_packages_re.search(mod.__file__) or \
+            (hasattr(mod, "__package__") and
+             mod.__package__ in ("fastmap", "fastmap.fastmap"))):
+                continue
+        with open(mod.__file__) as f:
+            source = f.read()
+        module_source[mod.__name__] = source
+    return module_source
 
-class _RemoteProcessor(multiprocessing.Process):
+# def get_globals(func):
+#     to_pickle = {}
+#     for glob_k, glob_v in func.__globals__.items():
+#         if glob_k.startswith("_"):
+#             continue
+#         if glob_v == func:
+#             continue
+#         if glob_k in sys.builtin_module_names:
+#             continue
+#         if (getattr(glob_v, '__file__', None) and
+#             (glob_v.__file__.startswith(STD_LIB_DIR) or
+#              not glob_v.__file__.endswith('.py') or
+#              INSTALLED_LIB.search(glob_v.__file__))):
+#             continue
+
+#         to_pickle[glob_k] = glob_v
+#     print("PICKLING", to_pickle)
+#     return dill.dumps(to_pickle, recurse=True)
+
+
+class _CloudProcessor(multiprocessing.Process):
     def __init__(self, func, itdm, config):
         multiprocessing.Process.__init__(self)
         self.itdm = itdm
         self.func = func
 
-        pickled_func = dill.dumps(func)
+        pickled_func = dill.dumps(func, recurse=True)
+        # self.pickled_globs = get_globals(func)
         self.func_hash = get_hash(pickled_func)
         self.encoded_func = pickled_func
+        self.modules = get_module_source()
+        print("Passing up modules", self.modules.keys())
 
         self.log = config.log
         self.max_cloud_connections = config.max_cloud_connections
@@ -365,7 +404,7 @@ class _RemoteProcessor(multiprocessing.Process):
     def start(self):
         # TODO did I want to use this for something?
         # It does trigger and does so before .run
-        super(_RemoteProcessor, self).start()
+        super(_CloudProcessor, self).start()
 
     def run(self):
         threads = []
@@ -374,27 +413,29 @@ class _RemoteProcessor(multiprocessing.Process):
         req_dict = {
             'func': self.encoded_func,
             'func_hash': self.func_hash,
+            'modules': self.modules,
+            # 'pickled_globs': self.pickled_globs,
         }
         url = self.cloud_url_base + '/api/v1/map'
 
         try:
-            process_remote_batch(self.itdm, batch_tup, url, req_dict,
+            process_cloud_batch(self.itdm, batch_tup, url, req_dict,
                                  self.secret, self.log)
         except Exception as e:
             self.itdm.put_error(self.process_name, repr(e), batch_tup)
             if e.tb:
-                self.log.error("In remote process manager [%s]:\n%s", multiprocessing.current_process().name, e.tb)
+                self.log.error("In cloud process manager [%s]:\n%s", multiprocessing.current_process().name, e.tb)
             else:
-                self.log.error("In remote process manager [%s]: %r", multiprocessing.current_process().name, e)
+                self.log.error("In cloud process manager [%s]: %r", multiprocessing.current_process().name, e)
             return
 
-        self.log.debug("Opening %d remote connection(s)",
+        self.log.debug("Opening %d cloud connection(s)",
                        self.max_cloud_connections)
         for thread_id in range(self.max_cloud_connections):
-            self.log.debug("Creating remote thread %r", thread_id)
-            thread_args = (thread_id, url, self.func_hash, self.encoded_func,
-                           self.itdm, self.secret, self.log)
-            thread = threading.Thread(target=remote_thread, args=thread_args)
+            self.log.debug("Creating cloud thread %r", thread_id)
+            thread_args = (thread_id, url, req_dict, self.itdm, self.secret,
+                           self.log)
+            thread = threading.Thread(target=cloud_thread, args=thread_args)
             thread.start()
             threads.append(thread)
 
@@ -872,9 +913,9 @@ class Mapper():
                            self.config.local_processes)
         if self.config.exec_policy != ExecPolicy.LOCAL:
             if self._confirm_charges(iterable):
-                remote_proc = _RemoteProcessor(func, itdm, self.config)
-                remote_proc.start()
-                processors.append(remote_proc)
+                cloud_proc = _CloudProcessor(func, itdm, self.config)
+                cloud_proc.start()
+                processors.append(cloud_proc)
         print("we have %d processors" % len(processors))
 
         if not processors or not any(p.is_alive() for p in processors):

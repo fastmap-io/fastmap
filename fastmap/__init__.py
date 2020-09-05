@@ -1,11 +1,11 @@
 from .lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity,
-                  EveryProcessDead, RemoteError, CLIENT_VERSION, INIT_DOCSTRING,
+                  EveryProcessDead, CloudError, CLIENT_VERSION, INIT_DOCSTRING,
                   GLOBAL_INIT_DOCSTRING, FASTMAP_DOCSTRING)
 
 ExecPolicy = ExecPolicy
 Verbosity = Verbosity
 EveryProcessDead = EveryProcessDead
-RemoteError = RemoteError
+CloudError = CloudError
 FastmapConfig = FastmapConfig
 
 __version__ = CLIENT_VERSION
