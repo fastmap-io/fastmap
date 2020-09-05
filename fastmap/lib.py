@@ -187,6 +187,14 @@ def simplified_tb(tb):
     return tb
 
 
+def func_name(func):
+    """Safe way to get the name of a random function"""
+    try:
+        return func.__name__
+    except:
+        return repr(func)
+
+
 def process_local(func, itdm, log):
     try:
         batch_tup = itdm.checkout()
@@ -968,10 +976,10 @@ class Mapper():
         if is_seq:
             seq_len = len(iterable)
             self.log.debug("Applying %r to %d items and yielding the results.",
-                           func.__name__, seq_len)
+                           func_name(func), seq_len)
         else:
             self.log.debug("Applying %r to a generator and yielding the "
-                           "results.", func.__name__)
+                           "results.", func_name(func))
 
         initial_batch, has_more = self.initial_run(func, iterable)
         yield initial_batch

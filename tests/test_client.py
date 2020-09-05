@@ -1,4 +1,5 @@
 import base64
+import functools
 import math
 import pickle
 import random
@@ -18,10 +19,10 @@ from fastmap import (init, global_init, fastmap, _reset_global_config,
 FAKE_SECRET = "FAKE_SECRET_OF_LEN_96_FAKE_SECRET_OF_LEN_96_FAKE_SECRET_OF_" \
               "LEN_96_FAKE_SECRET_OF_LEN_96_FAKE_SEC"
 
-def calc_pi_basic(seed):
+def calc_pi_basic(seed, two=2.0):
     random.seed(seed)
-    x = random.random() * 2.0 - 1.0
-    y = random.random() * 2.0 - 1.0
+    x = random.random() * two - 1.0
+    y = random.random() * two - 1.0
     return 1 if x**2 + y**2 <= 1.0 else 0
 
 def calc_pi_dead_99(seed):
@@ -83,9 +84,18 @@ def test_local_no_init():
     assert pi == 3.12
 
 def test_local_global_init():
+    _reset_global_config()
     global_init(exec_policy="LOCAL")
     range_100 = range(100)
     pi = 4.0 * sum(fastmap(calc_pi_basic, range_100)) / len(range_100)
+    assert pi == 3.12
+
+def test_local_functools():
+    config = init(exec_policy="LOCAL")
+    range_100 = range(100)
+    _calc_pi_basic = functools.partial(calc_pi_basic, two=2.0)
+
+    pi = 4.0 * sum(config.fastmap(_calc_pi_basic, range_100)) / len(range_100)
     assert pi == 3.12
 
 def test_exec_policy():
@@ -334,7 +344,7 @@ def resp_headers():
 
 
 def test_fmt_bytes():
-    assert lib.fmt_bytes(1023) == "1023B"
+    assert lib.fmt_bytes(1023) == "1023.0B"
     assert lib.fmt_bytes(1024) == "1.0KB"
     assert lib.fmt_bytes(2048) == "2.0KB"
     assert lib.fmt_bytes(1024**2) == "1.0MB"
