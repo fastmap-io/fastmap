@@ -96,6 +96,14 @@ INIT_DOCSTRING = """
 
 dill.settings['recurse'] = True
 
+try:
+    # Windows / mac use spawn. Linux uses fork. Set to spawn
+    # because it has more issues and this provides a steady dev environment
+    # Do not remove without at least adding more unit tests which operate
+    # in a spawn environment
+    multiprocessing.set_start_method("spawn")
+except RuntimeError:
+    pass
 
 
 def set_docstring(docstr, docstr_prefix=''):
@@ -196,6 +204,7 @@ def func_name(func):
 
 
 def process_local(func, itdm, log):
+    func = dill.loads(func)
     try:
         batch_tup = itdm.checkout()
         while batch_tup:
@@ -368,34 +377,11 @@ def get_module_source():
         module_source[mod.__name__] = source
     return module_source
 
-# def get_globals(func):
-#     to_pickle = {}
-#     for glob_k, glob_v in func.__globals__.items():
-#         if glob_k.startswith("_"):
-#             continue
-#         if glob_v == func:
-#             continue
-#         if glob_k in sys.builtin_module_names:
-#             continue
-#         if (getattr(glob_v, '__file__', None) and
-#             (glob_v.__file__.startswith(STD_LIB_DIR) or
-#              not glob_v.__file__.endswith('.py') or
-#              INSTALLED_LIB.search(glob_v.__file__))):
-#             continue
-
-#         to_pickle[glob_k] = glob_v
-#     print("PICKLING", to_pickle)
-#     return dill.dumps(to_pickle, recurse=True)
-
 
 class _CloudProcessor(multiprocessing.Process):
-    def __init__(self, func, itdm, config):
+    def __init__(self, pickled_func, itdm, config):
         multiprocessing.Process.__init__(self)
         self.itdm = itdm
-        self.func = func
-
-        pickled_func = dill.dumps(func, recurse=True)
-        # self.pickled_globs = get_globals(func)
         self.func_hash = get_hash(pickled_func)
         self.encoded_func = pickled_func
         self.modules = get_module_source()
@@ -626,15 +612,20 @@ class FastmapLogger():
     processes and was requiring a lot of weird workarounds
     """
     def __init__(self, verbosity):
+
         if verbosity == Verbosity.LOUD:
             pass
         elif verbosity == Verbosity.NORMAL:
-            self.debug = lambda *args: None
+            self.debug = self.do_nothing
         elif verbosity == Verbosity.QUIET:
-            self.debug = lambda *args: None
-            self.info = lambda *args: None
+            self.debug = self.do_nothing
+            self.info = self.do_nothing
         else:
             raise AssertionError(f"Unknown value for verbosity '{verbosity}'")
+
+    def do_nothing(self, *args):
+        # This instead of a lambda because of pickling in multiprocessing
+        pass
 
     def debug(self, msg, *args):
         try:
@@ -909,10 +900,11 @@ class Mapper():
         itdm = InterThreadDataManager(iterable, self.avg_runtime,
                                       max_batches_in_queue)
 
+        pickled_func = dill.dumps(func, recurse=True)
         processors = []
         if self.config.exec_policy != ExecPolicy.CLOUD:
             for _ in range(self.config.local_processes):
-                proc_args = (func, itdm, self.log)
+                proc_args = (pickled_func, itdm, self.log)
                 local_proc = multiprocessing.Process(target=process_local,
                                                      args=proc_args)
                 local_proc.start()
@@ -921,7 +913,7 @@ class Mapper():
                            self.config.local_processes)
         if self.config.exec_policy != ExecPolicy.LOCAL:
             if self._confirm_charges(iterable):
-                cloud_proc = _CloudProcessor(func, itdm, self.config)
+                cloud_proc = _CloudProcessor(pickled_func, itdm, self.config)
                 cloud_proc.start()
                 processors.append(cloud_proc)
         print("we have %d processors" % len(processors))

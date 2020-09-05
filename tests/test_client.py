@@ -135,6 +135,45 @@ def test_lambda():
     the_sum = sum(config.fastmap(lambda x: 1.0/x if x%2 == 1 else -1.0/x, range_1_100))
     assert math.isclose(the_sum, 0.6936474305598223)
 
+
+def test_closure_basic():
+    config = init(exec_policy="LOCAL")
+    range_100 = range(100)
+    with pytest.raises(ZeroDivisionError):
+        #zero division error raises execution error
+        sum(config.fastmap(lambda x: 1.0/x, range_100))
+    range_1_100 = range(1, 1000)
+
+    def cl(x):
+        if x%2 == 1:
+            return 1.0/x
+        else:
+            return -1.0/x
+
+    the_sum = sum(config.fastmap(cl, range_1_100))
+    assert math.isclose(the_sum, 0.6936474305598223)
+
+
+def test_closure_real():
+    config = init(exec_policy="LOCAL")
+    range_100 = range(100)
+    with pytest.raises(ZeroDivisionError):
+        #zero division error raises execution error
+        sum(config.fastmap(lambda x: 1.0/x, range_100))
+    range_1_100 = range(1, 1000)
+
+    one = 1.0
+    def cl(x):
+        if x%2 == 1:
+            return one/x
+        else:
+            return -1 * one / x
+
+    the_sum = sum(config.fastmap(cl, range_1_100))
+    assert math.isclose(the_sum, 0.6936474305598223)
+
+
+
 def test_single_threaded(capsys, monkeypatch):
     # Set initial run duration to make it not process everything on first run
     # but don't change proc_overhead so that it decides processes are too much
@@ -320,7 +359,7 @@ def resp_headers():
 #     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
 #     with pytest.raises(EveryProcessDead):
 #         # Unauthorized will kill the cloud thread
-#         list(config.fastmap(lambda x: x**.5, range(100)))
+#         list(config.fastmap(sqrt, range(100)))
 #     stdio = capsys.readouterr()
 #     assert re.search("fastmap ERROR:.*?Unauthorized", stdio.out)
 
@@ -337,7 +376,7 @@ def resp_headers():
 #     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
 #     with pytest.raises(EveryProcessDead):
 #         # Unauthorized will kill the cloud thread
-#         list(config.fastmap(lambda x: x**.5, range(100)))
+#         list(config.fastmap(sqrt, range(100)))
 #     stdio = capsys.readouterr()
 #     assert re.search("fastmap ERROR:.*?credits", stdio.out)
 
