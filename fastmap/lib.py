@@ -199,9 +199,11 @@ def simplified_tb(tb):
 def func_name(func):
     """Safe way to get the name of a random function"""
     try:
-        return func.__name__
-    except:
-        return repr(func)
+        name = func.__name__
+    except AttributeError:
+        name = repr(func)
+    name = name[:40] + "..." if len(name) >= 45 else name
+    return name
 
 
 def process_local(func, itdm, log):
