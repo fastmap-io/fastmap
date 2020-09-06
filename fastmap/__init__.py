@@ -27,7 +27,7 @@ def fastmap(func, iterable):
     if _global_config:
         return _global_config.fastmap(func, iterable)
     else:
-        tmp_config = init(secret=None, exec_policy=ExecPolicy.LOCAL)
+        tmp_config = init(exec_policy=ExecPolicy.LOCAL)
         tmp_config.log.warning("Fastmap not initialized globally."
                                "Defaulting to LOCAL exec_policy.")
         return tmp_config.fastmap(func, iterable)

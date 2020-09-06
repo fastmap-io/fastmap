@@ -607,43 +607,56 @@ class FastmapLogger():
     processes and was requiring a lot of weird workarounds
     """
     def __init__(self, verbosity):
+        self.verbosity = verbosity
+        self.restore_verbosity()
 
-        if verbosity == Verbosity.LOUD:
+    def restore_verbosity(self):
+        self.debug = self._debug
+        self.info = self._info
+        self.warning = self._warning
+        self.error = self._error
+        if self.verbosity == Verbosity.LOUD:
             pass
-        elif verbosity == Verbosity.NORMAL:
-            self.debug = self.do_nothing
-        elif verbosity == Verbosity.QUIET:
-            self.debug = self.do_nothing
-            self.info = self.do_nothing
+        elif self.verbosity == Verbosity.NORMAL:
+            self.debug = self._do_nothing
+        elif self.verbosity == Verbosity.QUIET:
+            self.debug = self._do_nothing
+            self.info = self._do_nothing
         else:
-            raise AssertionError(f"Unknown value for verbosity '{verbosity}'")
+            raise AssertionError(f"Unknown verbosity '{self.verbosity}'")
 
-    def do_nothing(self, *args):
+    def hush(self):
+        self.debug = self._do_nothing
+        self.info = self._do_nothing
+        self.warning = self._do_nothing
+        self.error = self._do_nothing
+
+    def _do_nothing(self, *args):
         # This instead of a lambda because of pickling in multiprocessing
         pass
 
-    def debug(self, msg, *args):
+    def _debug(self, msg, *args):
         try:
             msg = msg % args
         except TypeError:
             pass
         print(Color.CYAN + "fastmap DEBUG:" + Color.CANCEL, msg)
 
-    def info(self, msg, *args):
+    def _info(self, msg, *args):
         try:
             msg = msg % args
         except TypeError:
             pass
         print(Color.YELLOW + "fastmap INFO:" + Color.CANCEL, msg)
 
-    def warning(self, msg, *args):
+    def _warning(self, msg, *args):
         try:
             msg = msg % args
         except TypeError:
             pass
         print(Color.RED + "fastmap WARNING:" + Color.CANCEL, msg)
 
-    def error(self, msg, *args):
+    def _error(self, msg, *args):
         try:
             msg = msg % args
         except TypeError:
@@ -688,6 +701,11 @@ class FastmapConfig():
         self.cloud_url_base = CLOUD_URL_BASE
         self.max_cloud_connections = 3
 
+        if multiprocessing.current_process().name != "MainProcess":
+            # Fixes issue with multiple loud inits during local multiprocessing
+            # in Mac / Windows
+            self.log.hush()
+
         if secret:
             assert len(secret) == SECRET_LEN
             self.secret = secret
@@ -714,8 +732,11 @@ class FastmapConfig():
                              "for use.")
 
         self.log.debug("Setup fastmap")
-        self.log.debug(" verbosity: %s.", verbosity)
-        self.log.debug(" exec_policy: %s", exec_policy)
+        self.log.debug(" verbosity: %s", self.verbosity)
+        self.log.debug(" exec_policy: %s", self.exec_policy)
+        if exec_policy != ExecPolicy.CLOUD:
+            self.log.debug(" local_processes: %d", self.local_processes)
+        self.log.restore_verbosity()
 
     @set_docstring(FASTMAP_DOCSTRING)
     def fastmap(self, func, iterable):
