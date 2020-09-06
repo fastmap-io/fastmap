@@ -386,7 +386,6 @@ class _CloudProcessor(multiprocessing.Process):
         self.func_hash = get_hash(pickled_func)
         self.encoded_func = pickled_func
         self.modules = get_module_source()
-        print("Passing up modules", self.modules.keys())
 
         self.log = config.log
         self.max_cloud_connections = config.max_cloud_connections
@@ -396,11 +395,6 @@ class _CloudProcessor(multiprocessing.Process):
         self.log.debug("Initialized cloud processor at %r. Func payload is %dB",
                        self.cloud_url_base, len(self.encoded_func))
 
-    def start(self):
-        # TODO did I want to use this for something?
-        # It does trigger and does so before .run
-        super(_CloudProcessor, self).start()
-
     def run(self):
         threads = []
 
@@ -409,7 +403,6 @@ class _CloudProcessor(multiprocessing.Process):
             'func': self.encoded_func,
             'func_hash': self.func_hash,
             'modules': self.modules,
-            # 'pickled_globs': self.pickled_globs,
         }
         url = self.cloud_url_base + '/api/v1/map'
 
@@ -917,7 +910,6 @@ class Mapper():
                 cloud_proc = _CloudProcessor(pickled_func, itdm, self.config)
                 cloud_proc.start()
                 processors.append(cloud_proc)
-        print("we have %d processors" % len(processors))
 
         if not processors or not any(p.is_alive() for p in processors):
             raise EveryProcessDead("No execution processes started. "
