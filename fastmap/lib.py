@@ -731,7 +731,7 @@ class FastmapConfig():
                         yield el
                 return
 
-            num_processed = 0
+            proc_cnt = 0
             if is_seq:
                 seq_len = len(iterable)
                 if not seq_len:
@@ -739,11 +739,11 @@ class FastmapConfig():
                 for batch in mapper.map(func, iterable, is_seq=True):
                     for el in batch:
                         yield el
-                    num_processed += len(batch)
-                    percent = num_processed / seq_len * 100
+                    proc_cnt += len(batch)
+                    percent = proc_cnt / seq_len * 100
                     elapsed_time = time.perf_counter() - start_time
-                    num_left = seq_len - num_processed
-                    time_remaining = elapsed_time * num_left / num_processed
+                    num_left = seq_len - proc_cnt
+                    time_remaining = elapsed_time * num_left / proc_cnt
                     graph_bar = '█' * int(percent / 2)
                     sys.stdout.write("fastmap: %s%s %.1f%% (%s remaining)\r%s" %
                                      (Color.GREEN, graph_bar, percent,
@@ -753,8 +753,8 @@ class FastmapConfig():
                 for batch in mapper.map(func, iterable, is_seq=False):
                     for el in batch:
                         yield el
-                    num_processed += len(batch)
-                    sys.stdout.write("fastmap: Processed %d\r" % num_processed)
+                    proc_cnt += len(batch)
+                    sys.stdout.write("fastmap: Processed %d\r" % proc_cnt)
                     sys.stdout.flush()
         except Exception as e:
             if mapper.itdm:
@@ -777,47 +777,48 @@ class FastmapConfig():
             self.log.error(error_msg)
             raise EveryProcessDead()
 
-        total_duration = time.perf_counter() - start_time
-        self._log_final_stats(mapper, num_processed, total_duration)
+        total_dur = time.perf_counter() - start_time
+        self._log_final_stats(func_name(func), mapper, proc_cnt,
+                              total_dur)
 
-    def _log_final_stats(self, mapper, num_processed, total_duration):
+    def _log_final_stats(self, fname, mapper, proc_cnt, total_dur):
 
         avg_runtime = mapper.avg_runtime
         total_vcpu_seconds = mapper.total_vcpu_seconds
 
         print()
         if not avg_runtime:
-            self.log.info("Fastmap processing done.")
+            self.log.info("Done processing %r." % fname)
         else:
-            time_saved = avg_runtime * num_processed - total_duration
+            time_saved = avg_runtime * proc_cnt - total_dur
             if time_saved > 3600:
-                self.log.info("Processed %d elements in %.2fs. "
+                self.log.info("Processed %d elements from %r in %.2fs. "
                               "You saved %.2f hours",
-                              num_processed, total_duration, time_saved / 3600)
+                              proc_cnt, fname, total_dur, time_saved / 3600)
             if time_saved > 60:
-                self.log.info("Processed %d elements in %.2fs. "
+                self.log.info("Processed %d elements from %r in %.2fs. "
                               "You saved %.2f minutes",
-                              num_processed, total_duration, time_saved / 60)
+                              proc_cnt, fname, total_dur, time_saved / 60)
             elif time_saved > 0.01:
-                self.log.info("Processed %d elements in %.2fs. "
+                self.log.info("Processed %d elements from %r in %.2fs. "
                               "You saved %.2f seconds",
-                              num_processed, total_duration, time_saved)
+                              proc_cnt, fname, total_dur, time_saved)
             elif abs(time_saved) < 0.01:
-                self.log.info("Processed %d elements in %.2fs. This ran at "
-                              "about the same speed as the builtin map.",
-                              num_processed, total_duration)
+                self.log.info("Processed %d elements from %r in %.2fs. This "
+                              "ran at about the same speed as the builtin map.",
+                              proc_cnt, fname, total_dur)
             elif self.exec_policy == ExecPolicy.LOCAL:
-                self.log.info("Processed %d elements in %.2fs. This ran slower "
-                              "than the map builtin by %.2fs (estimate). "
-                              "Consider not using fastmap here.",
-                              num_processed, total_duration, time_saved * -1)
+                self.log.info("Processed %d elements from %r in %.2fs. This "
+                              "ran slower than the map builtin by %.2fs "
+                              "(estimate). Consider not using fastmap here.",
+                              proc_cnt, fname, total_dur, time_saved * -1)
             else:
-                self.log.info("Processed %d elements in %.2fs. "
+                self.log.info("Processed %d elements from %r in %.2fs. "
                               "This ran slower than the map builtin by %.2fs "
                               "(estimate). Consider upgrading your "
                               "connection, reducing your data size, or using "
                               "exec_policy LOCAL or ADAPTIVE.",
-                              num_processed, total_duration, time_saved * -1)
+                              proc_cnt, fname, total_dur, time_saved * -1)
 
         if total_vcpu_seconds:
             if total_vcpu_seconds <= 120:
