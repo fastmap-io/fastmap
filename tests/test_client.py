@@ -83,7 +83,6 @@ def test_local_no_init():
     assert pi == 3.12
 
 def test_local_global_init():
-    _reset_global_config()
     global_init(exec_policy="LOCAL")
     range_100 = range(100)
     pi = 4.0 * sum(fastmap(calc_pi_basic, range_100)) / len(range_100)
@@ -96,6 +95,17 @@ def test_local_functools():
 
     pi = 4.0 * sum(config.fastmap(_calc_pi_basic, range_100)) / len(range_100)
     assert pi == 3.12
+
+def test_local_processes():
+    config = init(exec_policy="LOCAL", local_processes=2)
+    pi = 4.0 * sum(config.fastmap(calc_pi_basic, range(100))) / len(range(100))
+    assert pi == 3.12
+
+    # To get into local_processes <= 1
+    config = init(exec_policy="LOCAL", local_processes=1)
+    pi = 4.0 * sum(config.fastmap(calc_pi_basic, range(100))) / len(range(100))
+    assert pi == 3.12
+
 
 def test_exec_policy():
     with pytest.raises(AssertionError):

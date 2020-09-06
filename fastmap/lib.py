@@ -981,9 +981,16 @@ class Mapper():
             local_runtime = self.avg_runtime * len(iterable)
             if local_runtime < self._estimate_multiproc_runtime(iterable):
                 self.log.debug("Running single-threaded due to "
-                               "short expected runtime")
+                               "short expected runtime.")
                 yield list(map(func, iterable))
                 return
+
+        if self.config.local_processes <= 1 and \
+           self.config.exec_policy != ExecPolicy.CLOUD:
+            self.log.debug("Running single-threaded due to having <= 1 "
+                           "process available.")
+            yield list(map(func, iterable))
+            return
 
         self.processors, self.itdm = self._get_processors(func, iterable)
 
