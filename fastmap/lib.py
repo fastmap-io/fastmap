@@ -20,6 +20,7 @@ import requests
 
 CLIENT_VERSION = "0.0.1"
 CLOUD_URL_BASE = 'https://fastmap.io'
+SECRET_LEN = 64
 
 FASTMAP_DOCSTRING = """
     Map a function over an iterable and return the results.
@@ -227,14 +228,14 @@ def process_local(func, itdm, log):
 
 
 def hmac_digest(secret, payload):
-    return hmac.new(secret[48:].encode(), payload,
+    return hmac.new(secret[SECRET_LEN//2:].encode(), payload,
                     digestmod=hashlib.sha256).hexdigest()
 
 
 def create_headers(secret, payload):
     """Get headers for communicating with the fastmap.io cloud service"""
     return {
-        'Authorization': 'Bearer ' + secret[:48],
+        'Authorization': 'Bearer ' + secret[:SECRET_LEN//2],
         'Content-Encoding': 'gzip',
         'X-Python-Version': sys.version.replace('\n', ''),
         'X-Client-Version': CLIENT_VERSION,
@@ -694,7 +695,7 @@ class FastmapConfig():
         self.max_cloud_connections = 3
 
         if secret:
-            assert len(secret) == 96
+            assert len(secret) == SECRET_LEN
             self.secret = secret
         else:
             self.secret = None

@@ -10,14 +10,13 @@ import types
 
 import pytest
 
-sys.path.append(os.getcwd().split('/test')[0])
+sys.path.append(os.getcwd().split('/tests')[0])
 
 from fastmap import (init, global_init, fastmap, _reset_global_config,
                      EveryProcessDead, lib, FastmapConfig)
 # from fastmap.lib import FastmapConfig
 
-FAKE_SECRET = "FAKE_SECRET_OF_LEN_96_FAKE_SECRET_OF_LEN_96_FAKE_SECRET_OF_" \
-              "LEN_96_FAKE_SECRET_OF_LEN_96_FAKE_SEC"
+TEST_SECRET = "TEST"*(64//4)
 
 def calc_pi_basic(seed, two=2.0):
     random.seed(seed)
@@ -223,7 +222,6 @@ def test_order(monkeypatch):
     assert order_range == list(range(10000))
 
 
-
 def test_no_secret(monkeypatch, capsys):
     config = init(exec_policy="CLOUD")
     stdio = capsys.readouterr()
@@ -237,7 +235,7 @@ def test_no_secret(monkeypatch, capsys):
 
 def test_remote_no_connection(monkeypatch, capsys):
     # disable_socket()
-    config = init(exec_policy="CLOUD", verbosity="LOUD", secret=FAKE_SECRET)
+    config = init(exec_policy="CLOUD", verbosity="LOUD", secret=TEST_SECRET)
     config.cloud_url_base = "http://localhost:9999"
     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
@@ -267,14 +265,14 @@ def test_confirm_charges_basic(capsys, monkeypatch):
 
     # If a secret is correctly provided for cloud, warn about confirming
     # charges and do not set to local config policy
-    config = init(exec_policy="CLOUD", secret=FAKE_SECRET)
+    config = init(exec_policy="CLOUD", secret=TEST_SECRET)
     stdio = capsys.readouterr()
     assert re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert not re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
     assert config.exec_policy == "CLOUD"
 
     # If we set confirm charges, assert no warnings are thrown
-    config = init(exec_policy="CLOUD", secret=FAKE_SECRET, confirm_charges=True)
+    config = init(exec_policy="CLOUD", secret=TEST_SECRET, confirm_charges=True)
     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
     monkeypatch.setattr(lib.FastmapLogger, "input", fake_input_no)
@@ -298,7 +296,7 @@ def test_confirm_charges_basic(capsys, monkeypatch):
     assert re.search(r"Continue anyway\?", stdio.out)
 
     # Adaptive should log cancelled
-    config = init(exec_policy="ADAPTIVE", secret=FAKE_SECRET, confirm_charges=True)
+    config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, confirm_charges=True)
     config.cloud_url_base = "http://localhost:9999"
     list(config.fastmap(lambda x: x**.5, range(100)))
     stdio = capsys.readouterr()
@@ -343,7 +341,7 @@ def resp_headers():
 #                        content=resp,
 #                        status_code=200,
 #                        headers=resp_headers())
-#     config = init(exec_policy="CLOUD", secret=FAKE_SECRET)
+#     config = init(exec_policy="CLOUD", secret=TEST_SECRET)
 #     config.cloud_url_base = "localhost:9999"
 #     assert math.isclose(sum(config.fastmap(lambda x: 1/x, range(1, 100))),
 #                         sum(results))
@@ -354,7 +352,7 @@ def resp_headers():
 #     requests_mock.post('localhost:9999/api/v1/map',
 #                        content=resp,
 #                        status_code=401)
-#     config = init(exec_policy="CLOUD", secret=FAKE_SECRET)
+#     config = init(exec_policy="CLOUD", secret=TEST_SECRET)
 #     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
 #     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
 #     with pytest.raises(EveryProcessDead):
@@ -371,7 +369,7 @@ def resp_headers():
 #     requests_mock.post('localhost:9999/api/v1/map',
 #                        content=resp,
 #                        status_code=402)
-#     config = init(exec_policy="CLOUD", secret=FAKE_SECRET)
+#     config = init(exec_policy="CLOUD", secret=TEST_SECRET)
 #     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
 #     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
 #     with pytest.raises(EveryProcessDead):

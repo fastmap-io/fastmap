@@ -1,4 +1,4 @@
 # Client SDK requirements
-dill>0.3,<1.0
-requests>2.4,<2.5
-psutil>5.7,<6.0
+dill>=0.3.2,<0.4
+requests>=2.24,<2.25
+psutil>=5.7,<6.0
