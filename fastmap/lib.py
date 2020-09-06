@@ -15,7 +15,6 @@ import time
 import traceback
 
 import dill
-import psutil
 import requests
 
 CLIENT_VERSION = "0.0.1"
@@ -703,9 +702,10 @@ class FastmapConfig():
             self.local_processes = local_processes
         else:
             try:
+                import psutil
                 self.local_processes = len(psutil.Process().cpu_affinity())
-            except AttributeError:
-                self.local_processes = psutil.cpu_count()
+            except (ImportError, AttributeError):
+                self.local_processes = os.cpu_count()
             self.local_processes -= 2
 
         if not confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
