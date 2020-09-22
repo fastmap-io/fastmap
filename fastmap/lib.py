@@ -20,6 +20,8 @@ import requests
 CLIENT_VERSION = "0.0.1"
 CLOUD_URL_BASE = 'https://fastmap.io'
 SECRET_LEN = 64
+EXECUTION_ENV = "LOCAL"
+
 
 FASTMAP_DOCSTRING = """
     Map a function over an iterable and return the results.
@@ -227,16 +229,21 @@ def process_local(func, itdm, log):
                   multiprocessing.current_process().name, tb)
         return
 
+def auth_token(secret):
+    return secret[:SECRET_LEN//2]
+
+def sign_token(secret):
+    return secret[SECRET_LEN//2:]
 
 def hmac_digest(secret, payload):
-    return hmac.new(secret[SECRET_LEN//2:].encode(), payload,
+    return hmac.new(sign_token(secret).encode(), payload,
                     digestmod=hashlib.sha256).hexdigest()
 
 
 def create_headers(secret, payload):
     """Get headers for communicating with the fastmap.io cloud service"""
     return {
-        'Authorization': 'Bearer ' + secret[:SECRET_LEN//2],
+        'Authorization': 'Bearer ' + auth_token(secret),
         'Content-Encoding': 'gzip',
         'X-Python-Version': sys.version.replace('\n', ''),
         'X-Client-Version': CLIENT_VERSION,
@@ -254,8 +261,8 @@ def check_unpickle_resp(resp, secret, maybe_json=False):
         cloud_hash = hmac_digest(secret, resp.content)
         if resp.headers['X-Content-Signature'] != cloud_hash:
             raise CloudError("Cloud checksum did not match. Will not unpickle.")
-        return pickle.loads(base64.b64decode(resp.content))
-    except (CloudError, pickle.UnpicklingError) as e:
+        return pickle.loads(base64.b64decode(gzip.decompress(resp.content)))
+    except (CloudError, pickle.UnpicklingError, gzip.BadGzipFile) as e:
         if maybe_json:
             try:
                 return json.loads(resp.content)
@@ -290,8 +297,8 @@ def process_cloud_batch(itdm, batch_tup, url, req_dict, secret, log):
             log.warning(resp.headers['X-Server-Warning'])
 
         total_request = time.perf_counter() - start_req_time
-        total_application = float(resp.headers['X-Total-Seconds'])
-        total_mapping = resp_dict['map_seconds']
+        total_application = float(resp.headers['X-Application-Seconds'])
+        total_mapping = float(resp.headers['X-Map-Seconds'])
         req_time_per_el = total_request / len(results)
         app_time_per_el = total_application / len(results)
         map_time_per_el = total_mapping / len(results)
@@ -313,7 +320,7 @@ def process_cloud_batch(itdm, batch_tup, url, req_dict, secret, log):
     if resp.status_code == 401:
         raise CloudError("Unauthorized. Check your API token.")
     if resp.status_code == 403:
-        raise CloudError("Invalid client signature. Check your API token.")
+        raise CloudError(check_unpickle_resp(resp, secret, maybe_json=True))
     if resp.status_code == 402:
         resp_out = check_unpickle_resp(resp, secret)
         raise CloudError("Insufficient vCPU credits for this request. "
@@ -337,20 +344,20 @@ def process_cloud_batch(itdm, batch_tup, url, req_dict, secret, log):
 
 
 
-def cloud_thread(thread_id, url, req_dict,
-                             itdm, secret, log):
-
+def cloud_thread(thread_id, url, req_dict, itdm, secret, log):
     batch_tup = itdm.checkout()
+    if batch_tup:
+        log.debug("Starting cloud thread %d", thread_id)
 
     while batch_tup:
         try:
             process_cloud_batch(itdm, batch_tup, url, req_dict, secret, log)
-        except Exception as e:
+        except CloudError as e:
             proc_name = multiprocessing.current_process().name
             thread_id = threading.get_ident()
             error_loc = "%s: thread:%d" % (proc_name, thread_id)
             itdm.put_error(error_loc, repr(e), batch_tup)
-            if e.tb:
+            if hasattr(e, 'tb'):
                 log.error("In cloud process [%s]:\n%s",
                           threading.current_thread().name, e.tb)
             else:
@@ -365,14 +372,15 @@ def get_module_source():
     std_lib_dir = distutils.sysconfig.get_python_lib(standard_lib=True)
     module_source = {}
     for mod_name, mod in sys.modules.items():
-        if (mod_name in sys.builtin_module_names or \
-            mod_name.startswith("_") or \
-            not getattr(mod, '__file__', None) or \
-            mod.__file__.startswith(std_lib_dir) or \
-            not mod.__file__.endswith('.py') or \
-            site_packages_re.search(mod.__file__) or \
+        if (mod_name in sys.builtin_module_names or  # not builtin
+            mod_name.startswith("_") or  # not hidden
+            not getattr(mod, '__file__', None) or   # also not builtin
+            mod.__file__.startswith(std_lib_dir) or  # not stdlib
+            not mod.__file__.endswith('.py') or  # not c adapter
+            site_packages_re.search(mod.__file__) or  # not installed module
             (hasattr(mod, "__package__") and
-             mod.__package__ in ("fastmap", "fastmap.fastmap"))):
+             mod.__package__ in ("fastmap", "fastmap.fastmap"))): # not fastmap
+                # TODO, eventually we need to bring in site_packages as well
                 continue
         with open(mod.__file__) as f:
             source = f.read()
@@ -410,18 +418,18 @@ class _CloudProcessor(multiprocessing.Process):
         try:
             process_cloud_batch(self.itdm, batch_tup, url, req_dict,
                                  self.secret, self.log)
-        except Exception as e:
+        except CloudError as e:
             self.itdm.put_error(self.process_name, repr(e), batch_tup)
-            if e.tb:
+            if hasattr(e, 'tb') and e.tb:
                 self.log.error("In cloud process manager [%s]:\n%s", multiprocessing.current_process().name, e.tb)
             else:
                 self.log.error("In cloud process manager [%s]: %r", multiprocessing.current_process().name, e)
             return
 
-        self.log.debug("Opening %d cloud connection(s)",
-                       self.max_cloud_connections)
-        for thread_id in range(self.max_cloud_connections):
-            self.log.debug("Creating cloud thread %r", thread_id)
+        num_cloud_threads = min(self.max_cloud_connections,
+                                self.itdm.inbox_len())
+        self.log.debug("Opening %d cloud connection(s)", num_cloud_threads)
+        for thread_id in range(num_cloud_threads):
             thread_args = (thread_id, url, req_dict, self.itdm, self.secret,
                            self.log)
             thread = threading.Thread(target=cloud_thread, args=thread_args)
@@ -451,10 +459,13 @@ class InterThreadDataManager():
         self.state['total_vcpu_seconds'] = 0
         self.state['total_network_seconds'] = 0.0
 
-    def has_more_batches(self):
+    def inbox_len(self):
         if not self.state['inbox_capped']:
-            return True
-        if self.state['in_minus_out'] > 0:
+            return sys.maxsize
+        return self.state['in_minus_out']
+
+    def has_more_batches(self):
+        if self.inbox_len() > 0:
             return True
         return len(self._outbox) > 0
 
@@ -699,7 +710,7 @@ class FastmapConfig():
         self.verbosity = verbosity
         self.confirm_charges = confirm_charges
         self.cloud_url_base = CLOUD_URL_BASE
-        self.max_cloud_connections = 3
+        self.max_cloud_connections = 20
 
         if multiprocessing.current_process().name != "MainProcess":
             # Fixes issue with multiple loud inits during local multiprocessing
@@ -736,7 +747,7 @@ class FastmapConfig():
         self.log.debug(" exec_policy: %s", self.exec_policy)
         if exec_policy != ExecPolicy.CLOUD:
             self.log.debug(" local_processes: %d", self.local_processes)
-        self.log.restore_verbosity()
+        self.log.restore_verbosity()  # undo hush
 
     @set_docstring(FASTMAP_DOCSTRING)
     def fastmap(self, func, iterable):

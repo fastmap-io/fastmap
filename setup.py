@@ -23,7 +23,7 @@ setuptools.setup(
     name="fastmap",
     version=version,
     author="fastmap.io team",
-    author_email="scottmrogowski@gmail.com",
+    author_email="scott@fastmap.io",
     description="Fastmap is a drop-in replacement for `map` that " \
                 "parallelizes your code using both cloud and local resources.",
     long_description=long_description,

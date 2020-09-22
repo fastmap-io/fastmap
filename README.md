@@ -1,4 +1,4 @@
-> Note: Fastmap is currently in alpha and new fastmap.io accounts are available by request only. **Alpha software often has bugs and service disruptions.** While unintended, expect both until fastmap graduates to beta. If you are reading this, you are the salt-of-the-earth and I could use your help working out the kinks. Email me at scottmrogowski@gmail.com for a token!
+> Note: Fastmap is currently in alpha and new fastmap.io accounts are available by request only. **Alpha software often has bugs and service disruptions.** While unintended, expect both until fastmap graduates to beta. If you are reading this, you are the salt-of-the-earth and I could use your help working out the kinks. Email me at scott@fastmap.io for a token!
 
 ![Version 0.0.1](https://img.shields.io/badge/version-0.0.1-red)
 
@@ -69,4 +69,4 @@ No problem! You can still run fastmap without a fastmap.io account. Instead of p
 
 ### Questions
 
-Fastmap.io is a new project and I would love to hear your feedback. You can contact me directly at scottmrogowski@gmail.com.
+Fastmap.io is a new project and I would love to hear your feedback. You can contact me directly at scott@fastmap.io.
