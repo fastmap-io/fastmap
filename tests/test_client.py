@@ -18,6 +18,7 @@ from fastmap import (init, global_init, fastmap, _reset_global_config,
 
 TEST_SECRET = "TEST"*(64//4)
 
+
 def calc_pi_basic(seed, two=2.0):
     random.seed(seed)
     x = random.random() * two - 1.0
@@ -204,8 +205,17 @@ def test_process_local(capsys, monkeypatch):
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, iter(range_100))) / len(range_100)
     assert pi == 3.12
 
+
+def test_single_threaded_process_exception(capsys, monkeypatch):
+    config = init(exec_policy="LOCAL", local_processes=1)
+    monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
+    with pytest.raises(AssertionError):
+        list(config.fastmap(calc_pi_dead_99, range(100)))
+
+
 def test_process_exception(capsys, monkeypatch):
-    config = init(exec_policy="LOCAL")
+    config = init(exec_policy="LOCAL", local_processes=2)
     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
     with pytest.raises(EveryProcessDead):
@@ -258,7 +268,7 @@ def test_remote_no_connection(monkeypatch, capsys):
 def test_confirm_charges_basic(capsys, monkeypatch):
     # Basic local should not warn about confirming charges or any issues with
     # the secret
-    config = init(exec_policy="LOCAL")
+    config = init(exec_policy="LOCAL", local_processes=2)
     stdio = capsys.readouterr()
     assert not re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert not re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
@@ -267,7 +277,7 @@ def test_confirm_charges_basic(capsys, monkeypatch):
 
     # Basic cloud should warn about an absent secret and set execpolicy to local
     # (and say something about it)
-    config = init(exec_policy="CLOUD")
+    config = init(exec_policy="CLOUD", local_processes=2)
     stdio = capsys.readouterr()
     assert not re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
@@ -275,14 +285,14 @@ def test_confirm_charges_basic(capsys, monkeypatch):
 
     # If a secret is correctly provided for cloud, warn about confirming
     # charges and do not set to local config policy
-    config = init(exec_policy="CLOUD", secret=TEST_SECRET)
+    config = init(exec_policy="CLOUD", secret=TEST_SECRET, local_processes=2)
     stdio = capsys.readouterr()
     assert re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert not re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
     assert config.exec_policy == "CLOUD"
 
     # If we set confirm charges, assert no warnings are thrown
-    config = init(exec_policy="CLOUD", secret=TEST_SECRET, confirm_charges=True)
+    config = init(exec_policy="CLOUD", secret=TEST_SECRET, confirm_charges=True, local_processes=2)
     monkeypatch.setattr(lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(lib.Mapper, "PROC_OVERHEAD", 0)
     monkeypatch.setattr(lib.FastmapLogger, "input", fake_input_no)
@@ -306,7 +316,7 @@ def test_confirm_charges_basic(capsys, monkeypatch):
     assert re.search(r"Continue anyway\?", stdio.out)
 
     # Adaptive should log cancelled
-    config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, confirm_charges=True)
+    config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, confirm_charges=True, local_processes=2)
     config.cloud_url_base = "http://localhost:9999"
     list(config.fastmap(lambda x: x**.5, range(100)))
     stdio = capsys.readouterr()

@@ -730,12 +730,7 @@ class FastmapConfig():
         if local_processes:
             self.local_processes = local_processes
         else:
-            try:
-                import psutil
-                self.local_processes = len(psutil.Process().cpu_affinity())
-            except (ImportError, AttributeError):
-                self.local_processes = os.cpu_count()
-            self.local_processes -= 2
+            self.local_processes = os.cpu_count() - 2
 
         if not confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
             self.log.warning("The parameter 'confirm_charges' is False. Your "
