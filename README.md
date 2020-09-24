@@ -10,7 +10,7 @@ Fastmap is a drop-in replacement for `map` that makes your Python code in parall
 
 - **🚀 Speed up your code**. Fastmap automatically parallelizes your code and distributes work across both your local machine and the fastmap cloud service. If the cloud won't speed things up, fastmap will do all processing locally and you won't be charged.
 - **🐣 Trivial to setup**. Get an [API token](https://fastmap.io/) and replace every instance of `map` with `fastmap`. There are no servers to provision or code to upload. The SDK consists of only 3 functions.
-- **💵 Cheaper than you think**. When you signup, you get 10 [vCPU](https://www.techopedia.com/definition/30859/vcpu)-hours for free. After that, it's $10 for 200 vCPU-hours or $90 for 2000.
+- **💵 Cheaper than you think**. When you signup, you get $10 worth of credits for free. After that, it's $1 for 10 vCPU-hours + $1 per 10 GB returned.
 - **🧟‍♂️ Continuity plan**. We know you depend on us. If for any reason, in the future, fastmap.io must shut down, everything will be open sourced.
 
 Fastmap accelerates (often dramatically) the processing of data. Syntactically, it is all but equivalent to the builtin `map` function. Upon calling, fastmap calculates whether it would be faster to run map locally (in multiple processes) or upload most of the dataset for cloud processing. If no https://fastmap.io api token is used, fastmap will run everything locally. You are only charged when running fastmap in the cloud.
