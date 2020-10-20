@@ -1,4 +1,4 @@
-coverage run --concurrency=multiprocessing tests/test_client.py || exit 1
+coverage run --concurrency=multiprocessing -m pytest ./tests/test_client.py -vx || exit 1
 coverage combine
-coverage report --include=fastmap/*
-coverage html --include=fastmap/*
+coverage report --include=fastmap/client_lib.py,fastmap/__init__.py
+coverage html --include=fastmap/client_lib.py,fastmap/__init__.py

@@ -1,6 +1,6 @@
-from .lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity,
-                  EveryProcessDead, CloudError, CLIENT_VERSION, INIT_DOCSTRING,
-                  GLOBAL_INIT_DOCSTRING, FASTMAP_DOCSTRING)
+from .client_lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity,
+                         EveryProcessDead, CloudError, CLIENT_VERSION, INIT_DOCSTRING,
+                         GLOBAL_INIT_DOCSTRING, FASTMAP_DOCSTRING)
 
 ExecPolicy = ExecPolicy
 Verbosity = Verbosity
@@ -11,15 +11,16 @@ FastmapConfig = FastmapConfig
 __version__ = CLIENT_VERSION
 _global_config = None
 
+
 @set_docstring(GLOBAL_INIT_DOCSTRING)
-def global_init(**kwargs):
+def global_init(*args, **kwargs):
     global _global_config
-    _global_config = init(**kwargs)
+    _global_config = init(*args, **kwargs)
 
 
 @set_docstring(INIT_DOCSTRING)
-def init(**kwargs):
-    return FastmapConfig(**kwargs)
+def init(*args, **kwargs):
+    return FastmapConfig(*args, **kwargs)
 
 
 @set_docstring(FASTMAP_DOCSTRING)
@@ -32,10 +33,8 @@ def fastmap(func, iterable):
                                "Defaulting to LOCAL exec_policy.")
         return tmp_config.fastmap(func, iterable)
 
+
 def _reset_global_config():
     """ For unit tests. Do not use """
     global _global_config
     _global_config = None
-
-
-

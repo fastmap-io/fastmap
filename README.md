@@ -1,6 +1,6 @@
-> Note: Fastmap is currently in alpha. Email me if you're interested in testing and I will happily give you lots of free compute time: scott@fastmap.io
+> Note: Fastmap is currently in beta. 
 
-![Version 0.0.1](https://img.shields.io/badge/version-0.0.1-red)
+![Version 0.0.2](https://img.shields.io/badge/version-0.0.2-red)
 
 ### Zero setup distributed computing
 
