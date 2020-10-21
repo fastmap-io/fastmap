@@ -109,6 +109,9 @@ def test_return_type_seq():
 
     for verbosity in ("QUIET", "NORMAL"):
         config = init(exec_policy="LOCAL", verbosity=verbosity)
+        with pytest.raises(AssertionError):
+            list(config.fastmap(lambda x: x**.5, [], return_type="FAKE_RETURN_TYPE"))
+
 
         seq = config.fastmap(lambda x: x**.5, [], return_type="BATCHES")
         assert isinstance(seq, types.GeneratorType)
@@ -613,6 +616,19 @@ def test_fmt_time():
     assert client_lib.fmt_time(60 * 60) == "01:00:00"
     assert client_lib.fmt_time(60 * 60 + 1) == "01:00:01"
     assert client_lib.fmt_time(60 * 60 + 61) == "01:01:01"
+
+
+def test_fmt_dur():
+    assert client_lib.fmt_dur(.000009) == "0 milliseconds"
+    assert client_lib.fmt_dur(.9) == "900 milliseconds"
+    assert client_lib.fmt_dur(1) == "1.00 seconds"
+    assert client_lib.fmt_dur(59) == "59.00 seconds"
+    assert client_lib.fmt_dur(60) == "1.00 minutes"
+    assert client_lib.fmt_dur(61) == "1.02 minutes"
+    assert client_lib.fmt_dur(121) == "2.02 minutes"
+    assert client_lib.fmt_dur(60 * 60) == "1.00 hours"
+    assert client_lib.fmt_dur(60 * 60 + 1) == "1.00 hours"
+    assert client_lib.fmt_dur(60 * 60 + 61) == "1.02 hours"
 
 
 def test_namespace():

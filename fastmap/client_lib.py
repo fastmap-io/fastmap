@@ -158,11 +158,11 @@ def fmt_time(num_secs):
 
 
 def fmt_dur(num_secs):
-    if num_secs > 3600:
+    if num_secs >= 3600:
         return "%.2f hours" % (num_secs / 3600)
-    if num_secs > 60:
+    if num_secs >= 60:
         return "%.2f minutes" % (num_secs / 60)
-    if num_secs > 1:
+    if num_secs >= 1:
         return "%.2f seconds" % (num_secs)
     return "%d milliseconds" % (round(num_secs * 1000))
 
