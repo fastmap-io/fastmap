@@ -11,13 +11,13 @@ import hmac
 import json
 import multiprocessing
 import os
-import pickle
 import re
 import secrets
 import sys
 import threading
 import time
 import traceback
+import types
 
 import dill
 import requests
@@ -26,6 +26,8 @@ CLOUD_URL_BASE = 'https://fastmap.io'
 SECRET_LEN = 64
 EXECUTION_ENV = "LOCAL"
 CLIENT_VERSION = "0.0.2"
+UNSUPPORTED_TYPE_STRS = ('numpy', 'pandas')
+SUPPORTED_TYPES = (list, range, tuple, types.GeneratorType)
 
 
 FASTMAP_DOCSTRING = """
@@ -894,6 +896,11 @@ class FastmapConfig():
     def fastmap(self, func, iterable, return_type=ReturnType.ELEMENTS, label=""):
         if return_type not in ReturnType:
             raise AssertionError(f"Unknown return_type '{return_type}'")
+        iter_type = str(type(iterable))
+        if any(t in iter_type for t in UNSUPPORTED_TYPE_STRS):
+            self.log.warning(f"Type '{iter_type}' is explicitly not supported")
+        elif not any(isinstance(iterable, t) for t in SUPPORTED_TYPES):
+            self.log.warning(f"Type '{iter_type}' is not explictly supported")
 
         start_time = time.perf_counter()
         is_seq = hasattr(iterable, '__len__')
