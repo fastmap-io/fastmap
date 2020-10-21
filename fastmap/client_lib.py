@@ -36,6 +36,8 @@ FASTMAP_DOCSTRING = """
 
     :param function func: Function to map against.
     :param sequence|generator iterable: Iterable to map over.
+    :param str return_type: Either "ELEMENTS" or "BATCHES". Default
+        is "ELEMENTS".
     :param str label: Optional label to track this execution. Only meaningful if
         some execution occurs on the cloud. Default is "".
     :rtype: Generator
@@ -48,9 +50,11 @@ FASTMAP_DOCSTRING = """
       the filesystem. If run locally, these restrictions will not be enforced
       but because fastmap will likely execute out-of-order, running stateful
       functions is not recommended.
-    - The iterable may be either a sequence (list, tuple, etc) or a generator.
-      Both are processed lazily so fastmap will not begin execution unless
-      iterated over or execution is forced (e.g. by wrapping it in a list).
+    - The iterable can be a sequence (list, tuple, ndarray, dataframe, etc),
+      or a generator.
+    - Fastmap is a generator so the iterable is processed lazily and fastmap
+      will not begin execution unless iterated over or execution is forced
+      (e.g. by wrapping it in a list).
 
     For more documentation, go to https://fastmap.io/docs
 
@@ -151,6 +155,16 @@ def fmt_time(num_secs):
     return '{}s'.format(int(secs))
 
 
+def fmt_dur(num_secs):
+    if num_secs > 3600:
+        return "%.2f hours" % (num_secs / 3600)
+    if num_secs > 60:
+        return "%.2f minutes" % (num_secs / 60)
+    if num_secs > 1:
+        return "%.2f seconds" % (num_secs)
+    return "%d milliseconds" % (round(num_secs * 1000))
+
+
 def get_credits(seconds, bytes_egress):
     return 8 * (seconds * 10.0 / 3600.0 + bytes_egress * 10.0 / 1073741824.0)
 
@@ -210,6 +224,7 @@ class Namespace(dict):
 
 Verbosity = Namespace("QUIET", "NORMAL", "LOUD")
 ExecPolicy = Namespace("ADAPTIVE", "LOCAL", "CLOUD")
+ReturnType = Namespace("ELEMENTS", "BATCHES")
 Color = Namespace(
     GREEN="\033[92m",
     RED="\033[91m",
@@ -310,8 +325,8 @@ def check_unpickle_resp(resp, secret, maybe_json=False):
         cloud_hash = hmac_digest(secret, resp.content)
         if resp.headers['X-Content-Signature'] != cloud_hash:
             raise CloudError("Cloud checksum did not match. Will not unpickle.")
-        return pickle.loads(base64.b64decode(gzip.decompress(resp.content)))
-    except (CloudError, pickle.UnpicklingError, gzip.BadGzipFile) as e:
+        return dill.loads(base64.b64decode(gzip.decompress(resp.content)))
+    except (CloudError, dill.UnpicklingError, gzip.BadGzipFile) as e:
         if maybe_json:
             try:
                 return json.loads(resp.content)
@@ -326,7 +341,7 @@ def process_cloud_batch(itdm, batch_tup, url, req_dict, label, run_id,
 
     batch_idx, batch = batch_tup
     req_dict['batch'] = batch
-    pickled = pickle.dumps(req_dict)
+    pickled = dill.dumps(req_dict)
     encoded = base64.b64encode(pickled)
     payload = gzip.compress(encoded, compresslevel=1)
     headers = create_headers(secret, payload, req_dict['func_hash'],
@@ -396,7 +411,7 @@ def process_cloud_batch(itdm, batch_tup, url, req_dict, label, run_id,
     # catch all (should just be for 500s of which a few are explicitly defined)
     try:
         resp_out = check_unpickle_resp(resp, secret, maybe_json=True)
-    except (CloudError, pickle.UnpicklingError):
+    except (CloudError, dill.UnpicklingError):
         resp_out = resp.content
     raise CloudError("Unexpected cloud error %d %r" %
                      (resp.status_code, resp_out))
@@ -783,6 +798,31 @@ class FastmapLogger():
         return input("\n fastmap: " + msg)
 
 
+def seq_progress(gen, seq_len, start_time):
+    proc_cnt = 0
+    for batch in gen:
+        proc_cnt += len(batch)
+        yield batch, proc_cnt
+        percent = proc_cnt / seq_len * 100
+        elapsed_time = time.perf_counter() - start_time
+        num_left = seq_len - proc_cnt
+        time_remaining = elapsed_time * num_left / proc_cnt
+        graph_bar = '█' * int(percent / 2)
+        sys.stdout.write("fastmap: %s%s %.1f%% (%s remaining)\r%s" %
+                         (Color.GREEN, graph_bar, percent,
+                          fmt_time(time_remaining), Color.CANCEL))
+        sys.stdout.flush()
+
+
+def iter_progress(gen, *args):
+    proc_cnt = 0
+    for batch in gen:
+        proc_cnt += len(batch)
+        yield batch, proc_cnt
+        sys.stdout.write("fastmap: Processed %d\r" % proc_cnt)
+        sys.stdout.flush()
+
+
 class FastmapConfig():
     """
     The configuration object. Do not instantiate this directly.
@@ -851,44 +891,47 @@ class FastmapConfig():
         self.log.restore_verbosity()  # undo hush
 
     @set_docstring(FASTMAP_DOCSTRING)
-    def fastmap(self, func, iterable, label=""):
+    def fastmap(self, func, iterable, return_type=ReturnType.ELEMENTS, label=""):
+        if return_type not in ReturnType:
+            raise AssertionError(f"Unknown return_type '{return_type}'")
+
         start_time = time.perf_counter()
-        mapper = Mapper(self)
         is_seq = hasattr(iterable, '__len__')
+        seq_len = None
+
+        if is_seq:
+            seq_len = len(iterable)
+            if not seq_len:
+                return
+
+        mapper = Mapper(self)
+        fm = mapper.map(func, iterable, label, is_seq=is_seq)
         errors = []
 
         try:
             if self.verbosity == Verbosity.QUIET:
-                for batch in mapper.map(func, iterable, label, is_seq=is_seq):
-                    for el in batch:
-                        yield el
+                if return_type == ReturnType.BATCHES:
+                    for batch in fm:
+                        yield batch
+                else:
+                    # else return_type is ELEMENTS
+                    for batch in fm:
+                        for el in batch:
+                            yield el
                 return
 
             proc_cnt = 0
-            if is_seq:
-                seq_len = len(iterable)
-                if not seq_len:
-                    return
-                for batch in mapper.map(func, iterable, label, is_seq=True):
-                    for el in batch:
-                        yield el
-                    proc_cnt += len(batch)
-                    percent = proc_cnt / seq_len * 100
-                    elapsed_time = time.perf_counter() - start_time
-                    num_left = seq_len - proc_cnt
-                    time_remaining = elapsed_time * num_left / proc_cnt
-                    graph_bar = '█' * int(percent / 2)
-                    sys.stdout.write("fastmap: %s%s %.1f%% (%s remaining)\r%s" %
-                                     (Color.GREEN, graph_bar, percent,
-                                      fmt_time(time_remaining), Color.CANCEL))
-                    sys.stdout.flush()
+            progress_func = seq_progress if is_seq else iter_progress
+
+            if return_type == ReturnType.BATCHES:
+                for batch, proc_cnt in progress_func(fm, seq_len, start_time):
+                    yield batch
             else:
-                for batch in mapper.map(func, iterable, label, is_seq=False):
+                # else return_type is ELEMENTS
+                for batch, proc_cnt in progress_func(fm, seq_len, start_time):
                     for el in batch:
                         yield el
-                    proc_cnt += len(batch)
-                    sys.stdout.write("fastmap: Processed %d\r" % proc_cnt)
-                    sys.stdout.flush()
+
         except Exception as e:
             if mapper.itdm:
                 try:
@@ -915,43 +958,36 @@ class FastmapConfig():
                               total_dur)
 
     def _log_final_stats(self, fname, mapper, proc_cnt, total_dur):
-
         avg_runtime = mapper.avg_runtime
         total_credits_used = mapper.total_credits_used
 
         print()
         if not avg_runtime:
-            self.log.info("Done processing %r." % fname)
+            self.log.info("Done processing %r in %.2fms." % (fname, total_dur*1000))
         else:
             time_saved = avg_runtime * proc_cnt - total_dur
-            if time_saved > 3600:
-                self.log.info("Processed %d elements from %r in %.2fs. "
-                              "You saved %.2f hours",
-                              proc_cnt, fname, total_dur, time_saved / 3600)
-            if time_saved > 60:
-                self.log.info("Processed %d elements from %r in %.2fs. "
-                              "You saved %.2f minutes",
-                              proc_cnt, fname, total_dur, time_saved / 60)
-            elif time_saved > 0.01:
-                self.log.info("Processed %d elements from %r in %.2fs. "
-                              "You saved %.2f seconds",
-                              proc_cnt, fname, total_dur, time_saved)
-            elif abs(time_saved) < 0.01:
-                self.log.info("Processed %d elements from %r in %.2fs. This "
+            if time_saved > 0.02:
+                self.log.info("Processed %d elements from %r in %s. "
+                              "You saved ~%s", proc_cnt, fname,
+                              fmt_dur(total_dur), fmt_dur(time_saved))
+            elif abs(time_saved) < 0.02:
+                self.log.info("Processed %d elements from %r in %s. This "
                               "ran at about the same speed as the builtin map.",
-                              proc_cnt, fname, total_dur)
+                              proc_cnt, fname, fmt_dur(total_dur))
             elif self.exec_policy == ExecPolicy.LOCAL:
-                self.log.info("Processed %d elements from %r in %.2fs. This "
-                              "ran slower than the map builtin by %.2fs "
-                              "(estimate). Consider not using fastmap here.",
-                              proc_cnt, fname, total_dur, time_saved * -1)
+                self.log.info("Processed %d elements from %r in %s. This "
+                              "ran slower than the map builtin by ~%s. "
+                              "Consider not using fastmap here.",
+                              proc_cnt, fname, fmt_dur(total_dur),
+                              fmt_dur(time_saved * -1))
             else:
-                self.log.info("Processed %d elements from %r in %.2fs. "
-                              "This ran slower than the map builtin by %.2fs "
-                              "(estimate). Consider connecting to a faster "
+                self.log.info("Processed %d elements from %r in %s. "
+                              "This ran slower than the map builtin by ~%s. "
+                              "Consider connecting to a faster "
                               "internet, reducing your data size, or using "
                               "exec_policy LOCAL or ADAPTIVE.",
-                              proc_cnt, fname, total_dur, time_saved * -1)
+                              proc_cnt, fname, fmt_dur(total_dur),
+                              fmt_dur(time_saved * -1))
 
         if total_credits_used:
             self.log.info("Used %.3f credits.", total_credits_used)
@@ -1079,7 +1115,7 @@ class Mapper():
         first_batch_run_time = time.perf_counter() - start_time
         len_first_batch = len(ret)
         self.avg_runtime = first_batch_run_time / len_first_batch
-        self.avg_egress = len(pickle.dumps(ret)) / len_first_batch
+        self.avg_egress = len(dill.dumps(ret)) / len_first_batch
         self.log.debug("Processed first %d elements in %.2fs (%e per element)",
                        len_first_batch, first_batch_run_time, self.avg_runtime)
         return ret, True

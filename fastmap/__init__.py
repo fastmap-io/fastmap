@@ -1,11 +1,11 @@
 from .client_lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity,
-                         EveryProcessDead, CloudError, CLIENT_VERSION, INIT_DOCSTRING,
+                         EveryProcessDead, ReturnType, CLIENT_VERSION, INIT_DOCSTRING,
                          GLOBAL_INIT_DOCSTRING, FASTMAP_DOCSTRING)
 
 ExecPolicy = ExecPolicy
 Verbosity = Verbosity
+ReturnType = ReturnType
 EveryProcessDead = EveryProcessDead
-CloudError = CloudError
 FastmapConfig = FastmapConfig
 
 __version__ = CLIENT_VERSION
@@ -24,14 +24,14 @@ def init(*args, **kwargs):
 
 
 @set_docstring(FASTMAP_DOCSTRING)
-def fastmap(func, iterable):
+def fastmap(func, iterable, *args, **kwargs):
     if _global_config:
-        return _global_config.fastmap(func, iterable)
+        return _global_config.fastmap(func, iterable, *args, **kwargs)
     else:
         tmp_config = init(exec_policy=ExecPolicy.LOCAL)
         tmp_config.log.warning("Fastmap not initialized globally."
                                "Defaulting to LOCAL exec_policy.")
-        return tmp_config.fastmap(func, iterable)
+        return tmp_config.fastmap(func, iterable, *args, **kwargs)
 
 
 def _reset_global_config():

@@ -3,6 +3,7 @@ __pycache__
 scratch
 htmlcov
 .coverage
+.coverage.*
 *.egg-info
 *.eggs
 *.pyc

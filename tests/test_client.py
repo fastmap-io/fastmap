@@ -2,7 +2,6 @@ import base64
 import functools
 import io
 import math
-import multiprocessing
 import pickle
 import random
 import re
@@ -16,10 +15,16 @@ import pytest
 sys.path.append(os.getcwd().split('/tests')[0])
 
 from fastmap import (init, global_init, fastmap, _reset_global_config,
-                     EveryProcessDead, client_lib, FastmapConfig)
+                     EveryProcessDead, client_lib, FastmapConfig, ReturnType,
+                     Verbosity, ExecPolicy)
 # from fastmap.lib import FastmapConfig
 
 TEST_SECRET = "TEST" * (64 // 4)
+
+
+def flatten(lst):
+    # https://stackoverflow.com/questions/952914
+    return [el for sublst in lst for el in sublst]
 
 
 def primeFactors(n):
@@ -93,6 +98,94 @@ def test_local_basic():
     assert pi == 3.12
 
 
+def test_return_type_seq():
+    assert ReturnType.ELEMENTS == "ELEMENTS"
+    assert ReturnType.BATCHES == "BATCHES"
+    assert set(ReturnType) == set(("ELEMENTS", "BATCHES"))
+
+    range_0 = range(0)
+    range_1 = range(1)
+    range_100 = range(100)
+
+    for verbosity in ("QUIET", "NORMAL"):
+        config = init(exec_policy="LOCAL", verbosity=verbosity)
+
+        seq = config.fastmap(lambda x: x**.5, [], return_type="BATCHES")
+        assert isinstance(seq, types.GeneratorType)
+        assert list(seq) == []
+
+        seq = config.fastmap(lambda x: x**.5, range_0, return_type="BATCHES")
+        assert isinstance(seq, types.GeneratorType)
+        assert list(seq) == []
+
+        seq = config.fastmap(lambda x: x**.5, list(range_1), return_type="BATCHES")
+        assert isinstance(seq, types.GeneratorType)
+        seq = list(seq)
+        assert len(seq) == 1
+        assert isinstance(seq[0], list)
+
+        seq = config.fastmap(lambda x: x**.5, range_1, return_type="BATCHES")
+        assert isinstance(seq, types.GeneratorType)
+        seq = list(seq)
+        assert len(seq) == 1
+        assert isinstance(seq[0], list)
+
+        seq = config.fastmap(lambda x: x**.5, range_100, return_type="BATCHES")
+        assert isinstance(seq, types.GeneratorType)
+        seq = list(seq)
+        assert all(isinstance(e, list) for e in seq)
+        assert math.isclose(sum(flatten(seq)), 661.4629471031477)
+
+        seq = config.fastmap(lambda x: x**.5, list(range_100), return_type="BATCHES")
+        assert isinstance(seq, types.GeneratorType)
+        seq = list(seq)
+        assert all(isinstance(e, list) for e in seq)
+        assert math.isclose(sum(flatten(seq)), 661.4629471031477)
+
+
+class Wrapper():
+    def __init__(self, x):
+        self.x = x
+
+    def sqrt(self):
+        self.x = self.x**.5
+
+
+def test_objects():
+    def proc(x):
+        x.sqrt()
+        return x
+
+    seq_1 = [Wrapper(1)]
+    gen_1 = (Wrapper(x) for x in range(1, 2))
+    seq_100 = [Wrapper(x) for x in range(100)]
+    gen_100 = (Wrapper(x) for x in range(100))
+    seq_200000 = [Wrapper(x) for x in range(200000)]
+    gen_200000 = (Wrapper(x) for x in range(200000))
+
+    config = init(exec_policy="LOCAL")
+    res_seq_1 = list(config.fastmap(proc, seq_1))
+    assert len(res_seq_1) == 1
+    assert res_seq_1[0].x == 1
+    res_gen_1 = list(config.fastmap(proc, gen_1))
+    assert len(res_gen_1) == 1
+    assert res_gen_1[0].x == 1
+
+    res_seq_100 = list(config.fastmap(proc, seq_100))
+    assert len(res_seq_100) == 100
+    assert res_seq_100[99].x == 99 ** .5
+    res_gen_100 = list(config.fastmap(proc, gen_100))
+    assert len(res_gen_100) == 100
+    assert res_gen_100[99].x == 99 ** .5
+
+    res_seq_200000 = list(config.fastmap(proc, seq_200000))
+    assert len(res_seq_200000) == 200000
+    assert res_seq_200000[99999].x == 99999 ** .5
+    res_gen_200000 = list(config.fastmap(proc, gen_200000))
+    assert len(res_gen_200000) == 200000
+    assert res_gen_200000[99999].x == 99999 ** .5
+
+
 def test_local_empty():
     config = init(exec_policy="LOCAL")
 
@@ -140,6 +233,11 @@ def test_local_processes():
 
 
 def test_exec_policy():
+    assert ExecPolicy.LOCAL == "LOCAL"
+    assert ExecPolicy.CLOUD == "CLOUD"
+    assert ExecPolicy.ADAPTIVE == "ADAPTIVE"
+    assert set(ExecPolicy) == set(("LOCAL", "ADAPTIVE", "CLOUD"))
+
     with pytest.raises(AssertionError):
         init(exec_policy="INVALID")
     for exec_policy in ("LOCAL", "CLOUD", "ADAPTIVE"):
@@ -147,6 +245,11 @@ def test_exec_policy():
 
 
 def test_verbosity(capsys):
+    assert Verbosity.QUIET == "QUIET"
+    assert Verbosity.NORMAL == "NORMAL"
+    assert Verbosity.LOUD == "LOUD"
+    assert set(Verbosity) == set(("QUIET", "NORMAL", "LOUD"))
+
     config = init(exec_policy="LOCAL", verbosity="QUIET")
     list(config.fastmap(lambda x: x**x, range(10)))
     stdio = capsys.readouterr()
@@ -591,22 +694,6 @@ def test_log_etcetera(monkeypatch, capsys):
     assert resp == 'y'
     stdio = capsys.readouterr()
     assert "Hi" in stdio.out
-
-# def test
-
-    # config = init(exec_policy="LOCAL", secret="0" * 64, verbosity="LOUD")
-    # data = list(config.fastmap(primeFactors, range(15)))
-    # assert data
-
-
-    # def target():
-    #     return list(config.fastmap(primeFactors, range(15)))
-    # proc = multiprocessing.Process(target=target)
-    # proc.start()
-    # proc.join()
-
-
-
 
 
 if __name__ == '__main__':
