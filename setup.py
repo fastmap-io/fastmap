@@ -14,10 +14,6 @@ with open(os.path.join("fastmap", "client_lib.py")) as f:
     version = re.search(r"^CLIENT_VERSION \= \"([0-9.]+)\"", f.read(),
                         re.MULTILINE).group(1)
 
-with open("requirements.txt") as f:
-    requirements = map(str.strip, f.readlines())
-    requirements = list(filter(lambda l: not l.startswith("#"), requirements))
-
 url_base = "https://github.com/fastmap-io/fastmap"
 download_url = '%s/archive/fastmap-%s.tar.gz' % (url_base, version)
 
@@ -39,5 +35,8 @@ setuptools.setup(
         "Operating System :: OS Independent",
     ],
     python_requires='>=3.6',
-    install_requires=requirements,
+    install_requires=[
+        "dill>=0.3.2,<0.4",
+        "requests>=2.24,<3.0"
+    ],
 )
