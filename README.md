@@ -24,7 +24,7 @@ For complete documentation, go to [https://fastmap.io/docs](https://fastmap.io/d
 ### Installation
 
 ```bash
-python setup.py install
+pip install fastmap
 ```
 
 ### Quickstart
