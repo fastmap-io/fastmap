@@ -10,7 +10,7 @@ if sys.version_info[:2] < (3, 7):
 with open("README.md", "r") as fh:
     long_description = fh.read()
 
-with open(os.path.join("fastmap", "lib.py")) as f:
+with open(os.path.join("fastmap", "client_lib.py")) as f:
     version = re.search(r"^CLIENT_VERSION \= \"([0-9.]+)\"", f.read(),
                         re.MULTILINE).group(1)
 
