@@ -18,6 +18,8 @@ with open("requirements.txt") as f:
     requirements = map(str.strip, f.readlines())
     requirements = list(filter(lambda l: not l.startswith("#"), requirements))
 
+url_base = "https://github.com/fastmap-io/fastmap"
+download_url = '%s/archive/fastmap-%s.tar.gz' % (url_base, version)
 
 setuptools.setup(
     name="fastmap",
@@ -28,7 +30,8 @@ setuptools.setup(
                 "parallelizes your code on the cloud.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/fastmap-io/fastmap",
+    url=url_base,
+    download_url=download_url,
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
