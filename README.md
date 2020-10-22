@@ -1,6 +1,6 @@
 > Note: Fastmap is currently in beta. 
 
-![Version 0.0.2](https://img.shields.io/badge/version-0.0.2-red)
+![Version 0.0.4](https://img.shields.io/badge/version-0.0.4-red)
 
 ### Simple distributed computing
 
