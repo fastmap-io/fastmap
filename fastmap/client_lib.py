@@ -25,7 +25,7 @@ import requests
 CLOUD_URL_BASE = 'https://fastmap.io'
 SECRET_LEN = 64
 EXECUTION_ENV = "LOCAL"
-CLIENT_VERSION = "0.0.3"
+CLIENT_VERSION = "0.0.4"
 UNSUPPORTED_TYPE_STRS = ('numpy', 'pandas')
 SUPPORTED_TYPES = (list, range, tuple, types.GeneratorType)
 
