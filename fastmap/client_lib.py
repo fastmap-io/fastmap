@@ -28,7 +28,7 @@ EXECUTION_ENV = "LOCAL"
 CLIENT_VERSION = "0.0.4"
 UNSUPPORTED_TYPE_STRS = ('numpy', 'pandas')
 SUPPORTED_TYPES = (list, range, tuple, types.GeneratorType)
-
+MAX_PAYLOAD = 1024 * 1024 * 10  # 10 MB
 
 FASTMAP_DOCSTRING = """
     Map a function over an iterable and return the results.
@@ -343,9 +343,17 @@ def process_cloud_batch(itdm, batch_tup, url, req_dict, label, run_id,
 
     batch_idx, batch = batch_tup
     req_dict['batch'] = batch
-    pickled = dill.dumps(req_dict)
+    try:
+        pickled = dill.dumps(req_dict)
+    except Exception as ex:
+        raise CloudError("Could not pickle your data. "
+                         "Fastmap cannot run on the cloud.") from ex
     encoded = base64.b64encode(pickled)
     payload = gzip.compress(encoded, compresslevel=1)
+    if len(payload) >= MAX_PAYLOAD:
+        raise CloudError("Your task is too large for the cloud (%s / %s)." \
+                         "Try reducing your iterable or function size. " %
+                         (fmt_bytes(len(payload)), fmt_bytes(MAX_PAYLOAD)))
     headers = create_headers(secret, payload, req_dict['func_hash'],
                              label, run_id)
     log.debug("Making cloud request len=%d payload=%s (%s per el)",
@@ -409,6 +417,11 @@ def process_cloud_batch(itdm, batch_tup, url, req_dict, label, run_id,
         # DISCONTINUED (post-deprecated end-of-life)
         resp_out = check_unpickle_resp(resp, secret, maybe_json=True)
         raise CloudError("Fastmap.io error: %r" % resp_out['reason'])
+    if resp.status_code == 413:
+        # TOO_LARGE
+        raise CloudError("Your request was too large (%s). "
+                         "Find a way to reduce the size of your data or "
+                         "function and try again." % fmt_bytes(len(payload)))
 
     # catch all (should just be for 500s of which a few are explicitly defined)
     try:
@@ -496,13 +509,15 @@ class _CloudProcessor(multiprocessing.Process):
         self.process_name = multiprocessing.current_process().name
         self.label = label
         self.run_id = secrets.token_hex(8)
-        self.log.debug("Initialized cloud processor at %r. Func payload is %dB",
-                       self.cloud_url_base, len(self.encoded_func))
+        self.log.debug("Initialized cloud processor at %r. Func payload is %s",
+                       self.cloud_url_base, fmt_bytes(len(self.encoded_func)))
 
     def run(self):
         threads = []
 
         batch_tup = self.itdm.checkout()
+        if not batch_tup:
+            return
         req_dict = {
             'func': self.encoded_func,
             'func_hash': self.func_hash,
@@ -885,11 +900,11 @@ class FastmapConfig():
                              "automatically debited for use. To avoid "
                              "automatic debits, set confirm_charges=True")
 
-        self.log.debug("Setup fastmap")
-        self.log.debug(" verbosity: %s", self.verbosity)
-        self.log.debug(" exec_policy: %s", self.exec_policy)
+        self.log.info("Setup fastmap")
+        self.log.info(" verbosity: %s", self.verbosity)
+        self.log.info(" exec_policy: %s", self.exec_policy)
         if exec_policy != ExecPolicy.CLOUD:
-            self.log.debug(" local_processes: %d", self.local_processes)
+            self.log.info(" local_processes: %d", self.local_processes)
         self.log.restore_verbosity()  # undo hush
 
     @set_docstring(FASTMAP_DOCSTRING)
@@ -1068,7 +1083,19 @@ class Mapper():
 
         itdm = InterThreadDataManager(self.avg_runtime, max_batches_in_queue)
 
-        pickled_func = dill.dumps(func, recurse=True)
+        try:
+            pickled_func = dill.dumps(func, recurse=True)
+        except Exception as ex:
+            func_name = getattr(func, "__name__", str(func))
+            err = "Your function %r could not be pickled." % func_name
+            raise EveryProcessDead(err) from ex
+        if len(pickled_func) > MAX_PAYLOAD:
+            err = "Your function is too large to parallelize locally or in " \
+                  "the cloud (%s / %s). To reduce your function size, " \
+                  "identify and remove large variables." % \
+                  (fmt_bytes(len(pickled_func)), fmt_bytes(MAX_PAYLOAD))
+            raise EveryProcessDead(err)
+
         processors = []
         if self.config.exec_policy != ExecPolicy.CLOUD:
             for _ in range(self.config.local_processes):
@@ -1121,8 +1148,12 @@ class Mapper():
                 break
         first_batch_run_time = time.perf_counter() - start_time
         len_first_batch = len(ret)
+        try:
+            size_egress = len(dill.dumps(ret))
+        except Exception as ex:
+            raise EveryProcessDead("Could not pickle your results.") from ex
         self.avg_runtime = first_batch_run_time / len_first_batch
-        self.avg_egress = len(dill.dumps(ret)) / len_first_batch
+        self.avg_egress = size_egress / len_first_batch
         self.log.debug("Processed first %d elements in %.2fs (%e per element)",
                        len_first_batch, first_batch_run_time, self.avg_runtime)
         return ret, True
@@ -1136,11 +1167,11 @@ class Mapper():
     def map(self, func, iterable, label, is_seq=False):
         if is_seq:
             seq_len = len(iterable)
-            self.log.debug("Applying %r to %d items and yielding the results.",
-                           func_name(func), seq_len)
+            self.log.info("Applying %r to %d items and yielding the results.",
+                          func_name(func), seq_len)
         else:
-            self.log.debug("Applying %r to a generator and yielding the "
-                           "results.", func_name(func))
+            self.log.info("Applying %r to a generator and yielding the "
+                          "results.", func_name(func))
 
         initial_batch, maybe_more = self.initial_run(func, iterable)
         yield initial_batch
