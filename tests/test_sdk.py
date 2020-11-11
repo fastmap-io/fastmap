@@ -15,11 +15,11 @@ import pytest
 sys.path.append(os.getcwd().split('/tests')[0])
 
 from fastmap import (init, global_init, fastmap, _reset_global_config,
-                     EveryProcessDead, client_lib, FastmapConfig, ReturnType,
+                     EveryWorkerDead, sdk_lib, FastmapConfig, ReturnType,
                      Verbosity, ExecPolicy)
 # from fastmap.lib import FastmapConfig
 
-TEST_SECRET = "TEST" * (64 // 4)
+TEST_SECRET = "abcd" * (64 // 4)
 
 
 def flatten(lst):
@@ -79,7 +79,7 @@ def fake_input_no(self, msg):
 
 def test_local_basic():
     config = init(exec_policy="LOCAL")
-    assert isinstance(config, client_lib.FastmapConfig)
+    assert isinstance(config, sdk_lib.FastmapConfig)
     range_100 = range(100)
 
     gen = config.fastmap(calc_pi_basic, range_100)
@@ -248,12 +248,17 @@ def test_exec_policy():
 
 
 def test_verbosity(capsys):
+    assert Verbosity.SILENT == "SILENT"
     assert Verbosity.QUIET == "QUIET"
     assert Verbosity.NORMAL == "NORMAL"
     assert Verbosity.LOUD == "LOUD"
-    assert set(Verbosity) == set(("QUIET", "NORMAL", "LOUD"))
+    assert set(Verbosity) == set(("SILENT", "QUIET", "NORMAL", "LOUD"))
 
     config = init(exec_policy="LOCAL", verbosity="QUIET")
+    list(config.fastmap(lambda x: x**x, range(10)))
+    stdio = capsys.readouterr()
+    assert stdio.out == ""
+    config = init(exec_policy="LOCAL", verbosity="SILENT")
     list(config.fastmap(lambda x: x**x, range(10)))
     stdio = capsys.readouterr()
     assert stdio.out == ""
@@ -326,7 +331,7 @@ def test_single_threaded(monkeypatch):
     # Set initial run duration to make it not process everything on first run
     # but don't change proc_overhead so that it decides processes are too much
     config = init(exec_policy="LOCAL")
-    monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
     range_100 = range(100)
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, list(range_100))) / len(range_100)
     assert pi == 3.12
@@ -336,8 +341,8 @@ def test_single_threaded(monkeypatch):
 
 def test_process_local(monkeypatch):
     config = init(exec_policy="LOCAL")
-    monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-    monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
     range_100 = range(100)
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, list(range_100))) / len(range_100)
     assert pi == 3.12
@@ -347,8 +352,8 @@ def test_process_local(monkeypatch):
 
 def test_single_threaded_process(capsys, monkeypatch):
     config = init(exec_policy="LOCAL", local_processes=1)
-    monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-    monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
     range_100 = range(100)
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, list(range_100))) / len(range_100)
     assert pi == 3.12
@@ -356,25 +361,25 @@ def test_single_threaded_process(capsys, monkeypatch):
 
 def test_single_threaded_process_exception(capsys, monkeypatch):
     config = init(exec_policy="LOCAL", local_processes=1)
-    monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-    monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
     with pytest.raises(AssertionError):
         list(config.fastmap(calc_pi_dead_99, range(100)))
 
 
 def test_process_exception(capsys, monkeypatch):
     config = init(exec_policy="LOCAL", local_processes=2)
-    monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-    monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
-    with pytest.raises(EveryProcessDead):
+    monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
+    with pytest.raises(EveryWorkerDead):
         list(config.fastmap(calc_pi_dead_99, range(100)))
 
 
 def test_process_adaptive(capsys, monkeypatch):
     # remote will die but this will continue
     config = init(exec_policy="ADAPTIVE")
-    monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-    monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
     range_100 = range(100)
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, list(range_100))) / len(range_100)
     assert pi == 3.12
@@ -392,17 +397,17 @@ def test_slow_generator():
     assert pi == 3.12
 
     # test the do_die in the _FillInbox generators
-    with pytest.raises(EveryProcessDead):
+    with pytest.raises(EveryWorkerDead):
         sum(config.fastmap(lambda x: 1 / (x - 50), slow_gen(range(100))))
-    with pytest.raises(EveryProcessDead):
+    with pytest.raises(EveryWorkerDead):
         sum(config.fastmap(lambda x: 1 / (x - 50), slow_gen(list(range(100)))))
 
 
 def test_order(monkeypatch):
     config = init(exec_policy="LOCAL")
-    monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-    monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
-    monkeypatch.setattr(client_lib._FillInbox, "BATCH_DUR_GOAL", .0001)
+    monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
+    monkeypatch.setattr(sdk_lib._FillInbox, "BATCH_DUR_GOAL", .0001)
     order_range = list(config.fastmap(lambda x: int((x**2)**.5), range(10000)))
     assert order_range == list(range(10000))
 
@@ -410,26 +415,27 @@ def test_order(monkeypatch):
 def test_no_secret(monkeypatch, capsys):
     config = init(exec_policy="CLOUD")
     stdio = capsys.readouterr()
-    assert re.search("fastmap WARNING:.*?LOCAL.*?$", stdio.out)
+    assert re.search("fastmap WARNING:.*?LOCAL.\n", stdio.out)
     assert config.exec_policy == "LOCAL"
 
     config = init(exec_policy="ADAPTIVE")
     stdio = capsys.readouterr()
-    assert re.search("fastmap WARNING:.*?LOCAL.*?$", stdio.out)
+    assert re.search("fastmap WARNING:.*?LOCAL.\n", stdio.out)
     assert config.exec_policy == "LOCAL"
 
 
 def test_remote_no_connection(monkeypatch, capsys):
-    # disable_socket()
     config = init(exec_policy="CLOUD", verbosity="LOUD", secret=TEST_SECRET)
     config.cloud_url_base = "http://localhost:9999"
-    monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-    monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
     range_100 = range(100)
-    with pytest.raises(EveryProcessDead):
+    with pytest.raises(EveryWorkerDead):
         list(config.fastmap(lambda x: x**.5, range_100))
     stdio = capsys.readouterr()
-    assert re.search("could not connect", stdio.out)
+    # assert re.search("could not connect", stdio.out)
+    print(stdio.out)
+    assert False
 
 
 def test_confirm_charges_basic(capsys, monkeypatch):
@@ -460,9 +466,9 @@ def test_confirm_charges_basic(capsys, monkeypatch):
 
     # If we set confirm charges, assert no warnings are thrown
     config = init(exec_policy="CLOUD", secret=TEST_SECRET, confirm_charges=True, local_processes=2)
-    monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-    monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
-    monkeypatch.setattr(client_lib.FastmapLogger, "input", fake_input_no)
+    monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+    monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
+    monkeypatch.setattr(sdk_lib.FastmapLogger, "input", fake_input_no)
     stdio = capsys.readouterr()
     assert not re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert not re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
@@ -472,12 +478,12 @@ def test_confirm_charges_basic(capsys, monkeypatch):
     # Using the same config, ensure that every process dies with a fake url.
     # There should only be 1 process which can die
     config.cloud_url_base = "http://localhost:9999"
-    with pytest.raises(EveryProcessDead):
+    with pytest.raises(EveryWorkerDead):
         list(config.fastmap(lambda x: x**.5, range(100)))
     stdio = capsys.readouterr()
     assert re.search(r"Continue\?", stdio.out)
 
-    with pytest.raises(EveryProcessDead):
+    with pytest.raises(EveryWorkerDead):
         list(config.fastmap(lambda x: x**.5, iter(range(100))))
     stdio = capsys.readouterr()
     assert re.search(r"Continue anyway\?", stdio.out)
@@ -490,7 +496,7 @@ def test_confirm_charges_basic(capsys, monkeypatch):
     assert re.search(r"fastmap INFO:.*?cancelled", stdio.out)
 
     # Test enter yes
-    monkeypatch.setattr(client_lib.FastmapLogger, "input", fake_input_yes)
+    monkeypatch.setattr(sdk_lib.FastmapLogger, "input", fake_input_yes)
     config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, confirm_charges=True)
     # monkeypatch.setattr('sys.stdin', io.StringIO('y\n'))
     data = list(config.fastmap(lambda x: x**.5, iter(range(100))))
@@ -505,7 +511,7 @@ def test_confirm_charges_basic(capsys, monkeypatch):
         return "n"
 
     # Test unrecognized input
-    monkeypatch.setattr(client_lib.FastmapLogger, "input", fake_input_try_again)
+    monkeypatch.setattr(sdk_lib.FastmapLogger, "input", fake_input_try_again)
     config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, confirm_charges=True)
     list(config.fastmap(lambda x: x**.5, iter(range(100))))
     stdio = capsys.readouterr()
@@ -534,8 +540,8 @@ def resp_headers():
     }
 
 # def test_remote_200(monkeypatch, requests_mock):
-#     monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-#     monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
+#     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+#     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
 
 #     results = list(map(lambda x: 1/x, range(1, 100)))
 
@@ -558,9 +564,9 @@ def resp_headers():
 #                        content=resp,
 #                        status_code=401)
 #     config = init(exec_policy="CLOUD", secret=TEST_SECRET)
-#     monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-#     monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
-#     with pytest.raises(EveryProcessDead):
+#     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+#     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
+#     with pytest.raises(EveryWorkerDead):
 #         # Unauthorized will kill the cloud thread
 #         list(config.fastmap(sqrt, range(100)))
 #     stdio = capsys.readouterr()
@@ -574,9 +580,9 @@ def resp_headers():
 #                        content=resp,
 #                        status_code=402)
 #     config = init(exec_policy="CLOUD", secret=TEST_SECRET)
-#     monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-#     monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
-#     with pytest.raises(EveryProcessDead):
+#     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+#     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
+#     with pytest.raises(EveryWorkerDead):
 #         # Unauthorized will kill the cloud thread
 #         list(config.fastmap(sqrt, range(100)))
 #     stdio = capsys.readouterr()
@@ -589,9 +595,9 @@ def resp_headers():
 #                        content=resp,
 #                        status_code=402)
 #     config = init(exec_policy="CLOUD", secret=TEST_SECRET)
-#     monkeypatch.setattr(client_lib.Mapper, "INITIAL_RUN_DUR", 0)
-#     monkeypatch.setattr(client_lib.Mapper, "PROC_OVERHEAD", 0)
-#     with pytest.raises(EveryProcessDead):
+#     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
+#     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
+#     with pytest.raises(EveryWorkerDead):
 #         # Unauthorized will kill the cloud thread
 #         list(config.fastmap(sqrt, range(100)))
 #     stdio = capsys.readouterr()
@@ -599,40 +605,40 @@ def resp_headers():
 
 
 def test_fmt_bytes():
-    assert client_lib.fmt_bytes(1023) == "1023.0B"
-    assert client_lib.fmt_bytes(1024) == "1.0KB"
-    assert client_lib.fmt_bytes(2048) == "2.0KB"
-    assert client_lib.fmt_bytes(1024**2) == "1.0MB"
-    assert client_lib.fmt_bytes(1024**2 * 2) == "2.0MB"
-    assert client_lib.fmt_bytes(1024**3) == "1.0GB"
-    assert client_lib.fmt_bytes(1024**3 * 2) == "2.0GB"
+    assert sdk_lib.fmt_bytes(1023) == "1023.0B"
+    assert sdk_lib.fmt_bytes(1024) == "1.0KB"
+    assert sdk_lib.fmt_bytes(2048) == "2.0KB"
+    assert sdk_lib.fmt_bytes(1024**2) == "1.0MB"
+    assert sdk_lib.fmt_bytes(1024**2 * 2) == "2.0MB"
+    assert sdk_lib.fmt_bytes(1024**3) == "1.0GB"
+    assert sdk_lib.fmt_bytes(1024**3 * 2) == "2.0GB"
 
 
 def test_fmt_time():
-    assert client_lib.fmt_time(59) == "59s"
-    assert client_lib.fmt_time(60) == "01:00"
-    assert client_lib.fmt_time(61) == "01:01"
-    assert client_lib.fmt_time(121) == "02:01"
-    assert client_lib.fmt_time(60 * 60) == "01:00:00"
-    assert client_lib.fmt_time(60 * 60 + 1) == "01:00:01"
-    assert client_lib.fmt_time(60 * 60 + 61) == "01:01:01"
+    assert sdk_lib.fmt_time(59) == "59s"
+    assert sdk_lib.fmt_time(60) == "01:00"
+    assert sdk_lib.fmt_time(61) == "01:01"
+    assert sdk_lib.fmt_time(121) == "02:01"
+    assert sdk_lib.fmt_time(60 * 60) == "01:00:00"
+    assert sdk_lib.fmt_time(60 * 60 + 1) == "01:00:01"
+    assert sdk_lib.fmt_time(60 * 60 + 61) == "01:01:01"
 
 
 def test_fmt_dur():
-    assert client_lib.fmt_dur(.000009) == "0 milliseconds"
-    assert client_lib.fmt_dur(.9) == "900 milliseconds"
-    assert client_lib.fmt_dur(1) == "1.00 seconds"
-    assert client_lib.fmt_dur(59) == "59.00 seconds"
-    assert client_lib.fmt_dur(60) == "1.00 minutes"
-    assert client_lib.fmt_dur(61) == "1.02 minutes"
-    assert client_lib.fmt_dur(121) == "2.02 minutes"
-    assert client_lib.fmt_dur(60 * 60) == "1.00 hours"
-    assert client_lib.fmt_dur(60 * 60 + 1) == "1.00 hours"
-    assert client_lib.fmt_dur(60 * 60 + 61) == "1.02 hours"
+    assert sdk_lib.fmt_dur(.000009) == "0 milliseconds"
+    assert sdk_lib.fmt_dur(.9) == "900 milliseconds"
+    assert sdk_lib.fmt_dur(1) == "1.00 seconds"
+    assert sdk_lib.fmt_dur(59) == "59.00 seconds"
+    assert sdk_lib.fmt_dur(60) == "1.00 minutes"
+    assert sdk_lib.fmt_dur(61) == "1.02 minutes"
+    assert sdk_lib.fmt_dur(121) == "2.02 minutes"
+    assert sdk_lib.fmt_dur(60 * 60) == "1.00 hours"
+    assert sdk_lib.fmt_dur(60 * 60 + 1) == "1.00 hours"
+    assert sdk_lib.fmt_dur(60 * 60 + 61) == "1.02 hours"
 
 
 def test_namespace():
-    ns = client_lib.Namespace("A", B="C")
+    ns = sdk_lib.Namespace("A", B="C")
     assert ns.A == "A"
     assert ns.B == "C"
     assert 'A' in ns
@@ -689,7 +695,7 @@ def test_long_func(monkeypatch):
 def test_log_etcetera(monkeypatch, capsys):
     # log functions that can't be captured in normal tests
 
-    logger = client_lib.FastmapLogger("LOUD")
+    logger = sdk_lib.FastmapLogger("LOUD")
     logger.debug("Hello")
     stdio = capsys.readouterr()
     assert "fastmap DEBUG:" in stdio.out

@@ -10,7 +10,7 @@ if sys.version_info[:2] < (3, 7):
 with open("README.md", "r") as fh:
     long_description = fh.read()
 
-with open(os.path.join("fastmap", "client_lib.py")) as f:
+with open(os.path.join("fastmap", "sdk_lib.py")) as f:
     version = re.search(r"^CLIENT_VERSION \= \"([0-9.]+)\"", f.read(),
                         re.MULTILINE).group(1)
 
@@ -36,6 +36,7 @@ setuptools.setup(
     ],
     python_requires='>=3.6',
     install_requires=[
+        "msgpack>=1.0.0,<1.1.0",
         "dill>=0.3.2,<0.4",
         "requests>=2.24,<3.0"
     ],
