@@ -23,13 +23,16 @@ import msgpack
 import requests
 
 CLOUD_URL_BASE = 'https://fastmap.io'
+DEFAULT_MAX_CLOUD_WORKERS = 5
 SECRET_LEN = 64
 SECRET_RE = r'^[0-9a-z]{64}$'
 EXECUTION_ENV = "LOCAL"
 CLIENT_VERSION = "0.0.4"
 UNSUPPORTED_TYPE_STRS = ('numpy', 'pandas')
 SUPPORTED_TYPES = (list, range, tuple, Generator)
-MAX_PAYLOAD = 1024 * 1024 * 10  # 10 MB
+KB = 1024
+MB = 1024 ** 2
+GB = 1024 ** 3
 
 FASTMAP_DOCSTRING = """
     Map a function over an iterable and return the results.
@@ -72,8 +75,10 @@ INIT_PARAMS = """
     :param str verbosity: 'QUIET', 'NORMAL', or 'LOUD'. Default is 'NORMAL'.
     :param str exec_policy: 'LOCAL', 'CLOUD', or 'ADAPTIVE'.
         Default is 'ADAPTIVE'.
-    :param int local_processes: How many local processes (workers) to start.
-        By default, fastmap will start a maximum of num_cores * 2 - 2.
+    :param int max_local_workers: How many local workers (processes) to start.
+        By default, fastmap will start num_cores * 2 - 2.
+    :param int max_cloud_workers: Maximum number of cloud workers to start.
+        By default, fastmap will start 5.
     :param bool confirm_charges: Manually confirm cloud charges.
 
     For more documentation, go to https://fastmap.io/docs
@@ -140,14 +145,14 @@ def set_docstring(docstr: str, docstr_prefix='') -> FunctionType:
 def fmt_bytes(num_bytes: int) -> str:
     """
     Returns the human-readable byte quantity
-    e.g. 1024->1KB
+    e.g. 2048 -> 2.0KB
     """
-    if num_bytes >= 1024**3:
-        return "%.1fGB" % (num_bytes / 1024**3)
-    if num_bytes >= 1024**2:
-        return "%.1fMB" % (num_bytes / 1024**2)
-    if num_bytes >= 1024:
-        return "%.1fKB" % (num_bytes / 1024)
+    if num_bytes >= GB:
+        return "%.1fGB" % (num_bytes / GB)
+    if num_bytes >= MB:
+        return "%.1fMB" % (num_bytes / MB)
+    if num_bytes >= KB:
+        return "%.1fKB" % (num_bytes / KB)
     return "%.1fB" % num_bytes
 
 
@@ -183,9 +188,8 @@ def get_credits(seconds: float, bytes_egress: float) -> float:
     """
     Estimate the number of credits spent.
     100 credits per vcpu hour + 100 credits per byte egress
-    11024 ** 3 == 1GB
     """
-    return 8 * (seconds * 10.0 / 3600.0 + bytes_egress * 10.0 / (1024 ** 3))
+    return 8 * (seconds * 10.0 / 3600.0 + bytes_egress * 10.0 / GB)
 
 
 def get_func_hash(pickled_func: bytes) -> str:
@@ -328,28 +332,32 @@ class FastmapLogger():
 
     @staticmethod
     def _debug(msg, *args):
-        msg = msg % args
+        if args:
+            msg = msg % args
         print(Color.CYAN + "fastmap DEBUG:" + Color.CANCEL, msg)
 
     @staticmethod
     def _info(msg, *args):
-        msg = msg % args
+        if args:
+            msg = msg % args
         print(Color.YELLOW + "fastmap INFO:" + Color.CANCEL, msg)
 
     @staticmethod
     def _warning(msg, *args):
-        msg = msg % args
+        if args:
+            msg = msg % args
         print(Color.RED + "fastmap WARNING:" + Color.CANCEL, msg)
 
     @staticmethod
     def _error(msg, *args):
-        msg = msg % args
+        if args:
+            msg = msg % args
         print(Color.RED + "fastmap ERROR:" + Color.CANCEL, msg, flush=True)
 
     @staticmethod
     def input(msg):
         # This exists mostly for test mocking
-        return input("\n fastmap: " + msg)
+        return input(Color.CYAN + "\n fastmap: " + msg + Color.CANCEL)
 
 
 class InterThreadDataManager():
@@ -408,14 +416,15 @@ class InterThreadDataManager():
     def get_error(self):
         return self._errors.get_nowait()
 
-    def put_error(self, error_origin: str, error_str: str, batch_tup: tuple):
+    def put_error(self, error_origin: str, error_str: str, batch_tup=None):
         """
         Manage the error and put problem batch onto the front of the inbox
         so we can try again.
         """
         self._errors.put((error_origin, error_str))
-        with self._lock:
-            self._inbox.insert(0, batch_tup)
+        if batch_tup:
+            with self._lock:
+                self._inbox.insert(0, batch_tup)
 
     def kill(self):
         """
@@ -467,8 +476,7 @@ class InterThreadDataManager():
 
             with self._lock:
                 try:
-                    ret = self._inbox.pop(0)
-                    return ret
+                    return self._inbox.pop(0)
                 except IndexError:
                     pass
             time.sleep(.01)
@@ -518,7 +526,7 @@ def local_worker_func(func: FunctionType, itdm: InterThreadDataManager,
             ret = list(map(func, batch_iter))
             total_proc_time = time.perf_counter() - start
             runtime = total_proc_time / len(ret)
-            log.debug("Batch %d local cnt=%d dur=%.2fs (%.2e/el)",
+            log.debug("Batch %d local cnt=%d dur=%.2fs (%.2e/el).",
                       batch_idx, len(ret), total_proc_time, runtime)
             itdm.push_outbox(batch_idx, ret, runtime)
             batch_tup = itdm.checkout()
@@ -526,7 +534,7 @@ def local_worker_func(func: FunctionType, itdm: InterThreadDataManager,
         proc_name = multiprocessing.current_process().name
         itdm.put_error(proc_name, repr(e), batch_tup)
         tb = simplified_tb(traceback.format_exc())
-        log.error("In local worker [%s]:\n %s",
+        log.error("In local worker [%s]:\n %s.",
                   multiprocessing.current_process().name, tb)
         return
 
@@ -547,23 +555,29 @@ def hmac_digest(secret: str, payload: bytes) -> str:
                     digestmod=hashlib.sha256).hexdigest()
 
 
-def create_headers(secret: str, payload: bytes,
-                   label: str, run_id: str) -> dict:
-    """Get headers for communicating with the fastmap.io cloud service"""
+def basic_headers(secret: str, payload: bytes) -> dict:
+    """ Basic headers needed for most API calls. """
     return {
         'Authorization': 'Bearer ' + auth_token(secret),
         'X-Python-Version': sys.version.replace('\n', ''),
         'X-Client-Version': CLIENT_VERSION,
         'X-Content-Signature': hmac_digest(secret, payload),
-        'X-Label': label,
-        'X-Run-ID': run_id,
     }
 
 
-def post_request(url: str, **kwargs) -> requests.Response:
+def map_headers(secret: str, payload: bytes,
+                label: str, run_id: str) -> dict:
+    """Get headers for communicating with the fastmap.io cloud service"""
+    headers = basic_headers(secret, payload)
+    headers['X-Label'] = label
+    headers['X-Run-ID'] = run_id
+    return headers
+
+
+def post_request(url: str, data: bytes, headers: dict) -> requests.Response:
     """Since we have the same error handler around every post"""
     try:
-        return requests.post(url, **kwargs)
+        return requests.post(url, data=data, headers=headers)
     except requests.exceptions.ConnectionError:
         raise CloudError("Fastmap could not connect to %r. "
                          "Check your connection." % url) from None
@@ -615,21 +629,27 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
         'batch': compressed_batch
     }
     payload = msgpack.dumps(req_dict)
-    # if len(payload) >= MAX_PAYLOAD:
-    #     raise CloudError("Your task is too large for the cloud (%s / %s)." \
-    #                      "Try reducing your iterable or function size. " %
-    #                      (fmt_bytes(len(payload)), fmt_bytes(MAX_PAYLOAD)))
-    headers = create_headers(secret, payload, label, run_id)
-    log.debug("Making cloud request len=%d size=%s (%s/el)",
+
+    headers = map_headers(secret, payload, label, run_id)
+    log.debug("Making cloud request len=%d size=%s (%s/el)...",
               len(batch), fmt_bytes(len(compressed_batch)),
               fmt_bytes(len(compressed_batch) / len(batch)))
 
-    resp = post_request(url, data=payload, headers=headers)
+    while True:
+        print('post req proc')
+        resp = post_request(url, payload, headers)
+        print('post req proc 2')
+        if resp.status_code == 200 and msgpack.loads(resp.content).get('retry'):
+            log.debug("No cloud workers ready. Retrying in 5 seconds...")
+            time.sleep(5)
+            continue
+        break
     if resp.status_code == 200:
+        print('stat code 200')
         resp_dict = check_unpickle_resp(resp, secret)
         results = resp_dict['results']
         cloud_cid = resp.headers['X-Container-Id']
-        cloud_tid = resp.headers['X-Thread-Id']
+        worker_cid = resp.headers['X-Worker-Id']
         if 'X-Server-Warning' in resp.headers:
             # deprecations or anything else
             log.warning(resp.headers['X-Server-Warning'])
@@ -644,11 +664,11 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
 
         log.debug("Batch %d cloud cnt=%d "
                   "%.2fs/%.2fs/%.2fs map/app/req (%.2e/%.2e/%.2e per el) "
-                  "[%s/%s]",
+                  "[%s/%s].",
                   batch_idx, len(results),
                   total_mapping, total_application, total_request,
                   map_time_per_el, app_time_per_el, req_time_per_el,
-                  cloud_cid, cloud_tid)
+                  cloud_cid, worker_cid)
         itdm.push_outbox(batch_idx,
                          results,
                          None,
@@ -672,8 +692,8 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
         # NOT_ENOUGH_CREDITS
         resp_out = check_unpickle_resp(resp, secret)
         raise CloudError("Insufficient credits for this request. "
-                         "Your current balance is %.2f credits." %
-                         resp_out.get('credits_used', 0))
+                         "Your current balance is $%.4f." %
+                         resp_out.get('credits_used', 0) / 100)
     if resp.status_code == 403:
         # INVALID_SIGNATURE
         raise CloudError(check_unpickle_resp(resp, secret))
@@ -706,7 +726,7 @@ def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
     """
     batch_tup = itdm.checkout()
     if batch_tup:
-        log.debug("Starting cloud thread %d", thread_id)
+        log.debug("Starting cloud thread %d...", thread_id)
     while batch_tup:
         try:
             process_cloud_batch(itdm, batch_tup, url, func_hash,
@@ -716,11 +736,11 @@ def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
             thread_id = threading.get_ident()
             error_loc = "%s: thread:%d" % (proc_name, thread_id)
             itdm.put_error(error_loc, repr(e), batch_tup)
-            if hasattr(e, 'tb'):
-                log.error("In cloud thread [%s]:\n%s",
+            if hasattr(e, 'tb') and e.tb:
+                log.error("In cloud thread [%s]:\n%s.",
                           threading.current_thread().name, e.tb)
             else:
-                log.error("In cloud thread [%s]: %r",
+                log.error("In cloud thread [%s]: %r.",
                           threading.current_thread().name, e)
             return
 
@@ -748,7 +768,7 @@ def get_module_source() -> bytes:  # noqa
         with open(mod.__file__) as f:
             source = f.read()
         module_source[mod.__name__] = source
-    return gzip.compress(dill.dumps(module_source), compresslevel=1)
+    return module_source
 
 
 def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
@@ -759,18 +779,19 @@ def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
     """
 
     url = cloud_url_base + '/api/v1/done'
-    headers = {
-        'Authorization': 'Bearer ' + auth_token(secret),
-        'X-Python-Version': sys.version.replace('\n', ''),
-        'X-Client-Version': CLIENT_VERSION,
-    }
-    payload = {
+    payload = msgpack.dumps({
         "func_hash": func_hash,
         "run_id": run_id
-    }
-    resp = post_request(url, headers=headers, data=msgpack.dumps(payload))
+    })
+    headers = basic_headers(secret, payload)
+    try:
+        resp = post_request(url, payload, headers)
+    except CloudError:
+        log.error("Could not connect to /done endpoint.")
+
     if resp.status_code != 200:
-        log.error("Error when wrapping up execution %r", resp.content)
+        log.error("Error on final api call (%d) %r.",
+                  resp.status_code, resp.content)
 
 
 class _FillInbox(threading.Thread):
@@ -839,7 +860,7 @@ class FillInboxWithGen(_FillInbox):
             if self.do_die:
                 return
         self.log.debug("Done adding iterator to task inbox. %d batch(es). "
-                       "%d element(s) total", batch_cnt, element_cnt)
+                       "%d element(s) total.", batch_cnt, element_cnt)
         self.itdm.mark_inbox_capped()
 
 
@@ -861,7 +882,7 @@ class FillInboxWithSeq(_FillInbox):
             if self.do_die:
                 return
         self.log.debug("Done adding sequence to task inbox. %d batch(es). "
-                       "%d element(s) total", batch_cnt, element_cnt)
+                       "%d element(s) total.", batch_cnt, element_cnt)
         self.itdm.mark_inbox_capped()
 
 
@@ -879,7 +900,7 @@ def seq_progress(seq: Sequence, seq_len: int,
         num_left = seq_len - proc_cnt
         time_remaining = elapsed_time * num_left / proc_cnt
         graph_bar = '█' * int(percent / 2)
-        sys.stdout.write("fastmap: %s%s %.1f%% (%s remaining)\r%s" %
+        sys.stdout.write("%sfastmap: %s %.1f%% (%s remaining)\r%s" %
                          (Color.GREEN, graph_bar, percent,
                           fmt_time(time_remaining), Color.CANCEL))
         sys.stdout.flush()
@@ -895,8 +916,47 @@ def gen_progress(gen: Generator, *args) -> Generator:
     for batch in gen:
         proc_cnt += len(batch)
         yield batch, proc_cnt
-        sys.stdout.write("fastmap: Processed %d\r" % proc_cnt)
+        sys.stdout.write("%sfastmap: Processed %d\r%s" % (Color.GREEN, proc_cnt, Color.CANCEL))
         sys.stdout.flush()
+
+
+class AuthCheck(threading.Thread):
+    """
+    Thread to check the authorization status. This allows us to kill the
+    process before packaging and sending up a potentially large payload
+    """
+    def __init__(self, config, *args, **kwargs):
+        self.secret = config.secret
+        self.url = config.cloud_url_base + '/api/v1/auth'
+        self.log = config.log
+        super().__init__(*args, **kwargs)
+
+    def run(self):
+        payload = msgpack.dumps({})
+        headers = basic_headers(self.secret, payload)
+        try:
+            resp = post_request(self.url, payload, headers)
+        except CloudError:
+            self.log.warning("Cannot connect to %r. Check your network.",
+                             self.url)
+            self.success = False
+            return
+        if resp.status_code != 200:
+            try:
+                resp_content = msgpack.loads(resp.content)
+            except Exception:
+                resp_content = resp.content
+            try:
+                resp_content = "%s (%s)" % (resp_content['status'],
+                                            resp_content['reason'])
+            except KeyError:
+                pass
+
+            self.log.warning("Authentication failed for %r %r. ",
+                             self.url, resp_content)
+            self.success = False
+        self.log.info("Request to %r was successful.", self.url)
+        self.success = True
 
 
 class Mapper():
@@ -919,6 +979,12 @@ class Mapper():
         self.workers = []
         self.fill_inbox_thread = None
         self.itdm = None
+
+        if self.config.exec_policy != ExecPolicy.LOCAL:
+            self.auth_check = AuthCheck(self.config)
+            self.auth_check.start()
+        else:
+            self.auth_check = None
 
     def cleanup(self):
         """
@@ -948,8 +1014,8 @@ class Mapper():
             if hasattr(iterable, "__len__"):
                 credit_estimate = get_credits(self.avg_runtime * len(iterable),
                                               self.avg_egress * len(iterable))
-                user_input_query = "Estimate: %.3f credits. Continue?" % \
-                    credit_estimate
+                user_input_query = "Estimate: $%.4f. Continue?" % \
+                    credit_estimate / 100
             else:
                 user_input_query = "Cannot estimate credit usage because " \
                                    "iterable is a generator. Continue anyway?"
@@ -962,7 +1028,7 @@ class Mapper():
                                   "Continuing processing locally...")
                 return False
             self.log.warning("Unrecognized input of %r. "
-                             "Please input 'y' or 'n'", user_input)
+                             "Please input 'y' or 'n'.", user_input)
 
     def _get_workers(self, func: FunctionType, iterable: Iterable,
                      label: str) -> (list, InterThreadDataManager):
@@ -974,12 +1040,12 @@ class Mapper():
         """
         # TODO make this smarter
         if self.config.exec_policy == ExecPolicy.CLOUD:
-            max_batches_in_queue = self.config.max_cloud_connections
+            max_batches_in_queue = self.config.max_cloud_workers
         elif self.config.exec_policy == ExecPolicy.LOCAL:
-            max_batches_in_queue = self.config.local_processes
+            max_batches_in_queue = self.config.max_local_workers
         else:
-            max_batches_in_queue = self.config.local_processes + \
-                                   self.config.max_cloud_connections  # noqa
+            max_batches_in_queue = self.config.max_local_workers + \
+                                   self.config.max_cloud_workers  # noqa
 
         itdm = InterThreadDataManager(self.avg_runtime, max_batches_in_queue)
 
@@ -989,25 +1055,20 @@ class Mapper():
             func_name = getattr(func, "__name__", str(func))
             err = "Your function %r could not be pickled." % func_name
             raise EveryWorkerDead(err) from ex
-        # if len(pickled_func) > MAX_PAYLOAD:
-        #     err = "Your function is too large to parallelize locally or in " \
-        #           "the cloud (%s / %s). To reduce your function size, " \
-        #           "identify and remove large variables." % \
-        #           (fmt_bytes(len(pickled_func)), fmt_bytes(MAX_PAYLOAD))
-        #     raise EveryWorkerDead(err)
 
         workers = []
         if self.config.exec_policy != ExecPolicy.CLOUD:
-            for _ in range(self.config.local_processes):
+            for _ in range(self.config.max_local_workers):
                 proc_args = (pickled_func, itdm, self.log)
                 local_worker = multiprocessing.Process(target=local_worker_func,
                                                        args=proc_args)
                 local_worker.start()
                 workers.append(local_worker)
-            self.log.debug("Launching %d local workers",
-                           self.config.local_processes)
+            self.log.debug("Launching %d local workers...",
+                           self.config.max_local_workers)
         if self.config.exec_policy != ExecPolicy.LOCAL:
-            if self._confirm_charges(iterable):
+            self.auth_check.join()
+            if self.auth_check.success and self._confirm_charges(iterable):
                 cloud_supervisor = _CloudSupervisor(pickled_func, itdm,
                                                     self.config, label)
                 cloud_supervisor.start()
@@ -1028,7 +1089,7 @@ class Mapper():
         batch_size, etc.)
         :returns: the processed results, possibly more (but not certainly)
         """
-        self.log.debug("Estimating runtime with an initial test run")
+        self.log.debug("Estimating runtime with an initial test run...")
         iterable = iter(iterable)
         ret = []
         start_time = time.perf_counter()
@@ -1041,7 +1102,7 @@ class Mapper():
                     # Zero item case
                     return [], False
                 self.avg_runtime = (time.perf_counter() - start_time) / len(ret)
-                self.log.debug("Initial test run processed entire iterable")
+                self.log.debug("Initial test run processed entire iterable.")
                 return ret, False
             ret.append(func(item))
             if time.perf_counter() > end_loop_at:
@@ -1054,7 +1115,7 @@ class Mapper():
             raise EveryWorkerDead("Could not pickle your results.") from ex
         self.avg_runtime = first_batch_run_time / len_first_batch
         self.avg_egress = size_egress / len_first_batch
-        self.log.debug("Processed first %d elements in %.2fs (%.2e/element)",
+        self.log.debug("Processed first %d elements in %.2fs (%.2e/element).",
                        len_first_batch, first_batch_run_time, self.avg_runtime)
         return ret, True
 
@@ -1064,8 +1125,8 @@ class Mapper():
         on the available workers
         """
         local_runtime = self.avg_runtime * len(iterable)
-        total_proc_overhead = self.config.local_processes * self.PROC_OVERHEAD
-        total_process_runtime = local_runtime / self.config.local_processes
+        total_proc_overhead = self.config.max_local_workers * self.PROC_OVERHEAD
+        total_process_runtime = local_runtime / self.config.max_local_workers
         return total_proc_overhead + total_process_runtime
 
     def map(self, func: FunctionType, iterable: Iterable, label: str,
@@ -1077,11 +1138,11 @@ class Mapper():
 
         if is_seq:
             seq_len = len(iterable)
-            self.log.info("Applying %r to %d items and yielding the results.",
+            self.log.info("Applying %r to %d items and yielding the results...",
                           func_name(func), seq_len)
         else:
             self.log.info("Applying %r to a generator and yielding the "
-                          "results.", func_name(func))
+                          "results...", func_name(func))
 
         initial_batch, maybe_more = self.initial_run(func, iterable)
         yield initial_batch
@@ -1101,7 +1162,7 @@ class Mapper():
                 yield list(map(func, iterable))
                 return
 
-        if self.config.local_processes <= 1 and \
+        if self.config.max_local_workers <= 1 and \
            self.config.exec_policy == ExecPolicy.LOCAL:
             # If local, and only one process is available, we have no choice
             # except to run single-threaded
@@ -1154,22 +1215,23 @@ class FastmapConfig():
         "log",
         "exec_policy",
         "confirm_charges",
-        "local_processes",
-        "max_cloud_connections",
+        "max_local_workers",
+        "max_cloud_workers",
         "cloud_url_base",
     ]
 
     def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
                  exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
-                 local_processes=None, cloud_url_base=CLOUD_URL_BASE):
+                 max_local_workers=None, cloud_url_base=CLOUD_URL_BASE,
+                 max_cloud_workers=DEFAULT_MAX_CLOUD_WORKERS):
         if exec_policy not in ExecPolicy:
-            raise AssertionError(f"Unknown exec_policy '{exec_policy}'")
+            raise AssertionError(f"Unknown exec_policy '{exec_policy}'.")
         self.exec_policy = exec_policy
         self.log = FastmapLogger(verbosity)
         self.verbosity = verbosity
         self.cloud_url_base = cloud_url_base
         self.confirm_charges = confirm_charges
-        self.max_cloud_connections = 20
+        self.max_cloud_workers = max_cloud_workers
 
         if multiprocessing.current_process().name != "MainProcess":
             # Fixes issue with multiple loud inits during local multiprocessing
@@ -1180,7 +1242,7 @@ class FastmapConfig():
 
         if secret:
             if not re.match(SECRET_RE, secret):
-                raise AssertionError("Invalid secret token")
+                raise AssertionError("Invalid secret token.")
             self.secret = secret
         else:
             self.secret = None
@@ -1189,21 +1251,23 @@ class FastmapConfig():
                 self.log.warning("No secret provided. "
                                  "Setting exec_policy to LOCAL.")
 
-        if local_processes:
-            self.local_processes = local_processes
+        if max_local_workers:
+            self.max_local_workers = max_local_workers
         else:
-            self.local_processes = os.cpu_count() - 2
+            self.max_local_workers = os.cpu_count() - 2
 
         if not confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
             self.log.warning("Your fastmap credit balance will be "
                              "automatically debited for use. To avoid "
-                             "automatic debits, set confirm_charges=True")
+                             "automatic debits, set confirm_charges=True.")
 
-        self.log.info("Setup fastmap")
-        self.log.info(" verbosity: %s", self.verbosity)
-        self.log.info(" exec_policy: %s", self.exec_policy)
+        self.log.info("Setup fastmap.")
+        self.log.info(" verbosity: %s.", self.verbosity)
+        self.log.info(" exec_policy: %s.", self.exec_policy)
         if exec_policy != ExecPolicy.CLOUD:
-            self.log.info(" local_processes: %d", self.local_processes)
+            self.log.info(" max_local_workers: %d.", self.max_local_workers)
+        if exec_policy != ExecPolicy.LOCAL:
+            self.log.info(" max_cloud_workers: %d.", self.max_cloud_workers)
         self.log.restore_verbosity()  # undo hush
 
     @set_docstring(FASTMAP_DOCSTRING)
@@ -1218,9 +1282,9 @@ class FastmapConfig():
             raise AssertionError(f"Unknown return_type '{return_type}'")
         iter_type = str(type(iterable))
         if any(t in iter_type for t in UNSUPPORTED_TYPE_STRS):
-            self.log.warning(f"Type '{iter_type}' is explicitly not supported")
+            self.log.warning(f"Type '{iter_type}' is explicitly not supported.")
         elif not any(isinstance(iterable, t) for t in SUPPORTED_TYPES):
-            self.log.warning(f"Type '{iter_type}' is not explictly supported")
+            self.log.warning(f"Type '{iter_type}' is not explictly supported.")
 
         start_time = time.perf_counter()
         is_seq = hasattr(iterable, '__len__')
@@ -1297,7 +1361,7 @@ class FastmapConfig():
             time_saved = avg_runtime * proc_cnt - total_dur
             if time_saved > 0.02:
                 self.log.info("Processed %d elements from %r in %s. "
-                              "You saved ~%s", proc_cnt, fname,
+                              "You saved ~%s.", proc_cnt, fname,
                               fmt_dur(total_dur), fmt_dur(time_saved))
             elif abs(time_saved) < 0.02:
                 self.log.info("Processed %d elements from %r in %s. This "
@@ -1319,8 +1383,12 @@ class FastmapConfig():
                               fmt_dur(time_saved * -1))
 
         if total_credits_used:
-            self.log.info("Used %.3f credits.", total_credits_used)
-        self.log.info("Fastmap done")
+            self.log.info("Spent $%.4f.", total_credits_used / 100)
+        self.log.info("Fastmap done.")
+
+
+def chunk_bytes(payload: bytes, size: int) -> list:
+    return [payload[i:i+size] for i in range(0, len(payload), size)]
 
 
 class _CloudSupervisor(multiprocessing.Process):
@@ -1330,13 +1398,14 @@ class _CloudSupervisor(multiprocessing.Process):
     def __init__(self, pickled_func: bytes, itdm: InterThreadDataManager,
                  config: FastmapConfig, label: str):
         multiprocessing.Process.__init__(self)
+        encoded_func = msgpack.dumps({
+            'func': pickled_func,
+            'modules': get_module_source()})
+        self.func_payload = gzip.compress(encoded_func, compresslevel=1)
+        self.func_hash = get_func_hash(self.func_payload)
         self.itdm = itdm
-        self.func_hash = get_func_hash(pickled_func)
-        self.encoded_func = gzip.compress(pickled_func, compresslevel=1)
-        self.encoded_modules = get_module_source()
-
         self.log = config.log
-        self.max_cloud_connections = config.max_cloud_connections
+        self.max_cloud_workers = config.max_cloud_workers
         self.cloud_url_base = config.cloud_url_base
         self.secret = config.secret
         self.process_name = multiprocessing.current_process().name
@@ -1344,7 +1413,7 @@ class _CloudSupervisor(multiprocessing.Process):
         self.run_id = secrets.token_hex(8)
         self.log.info("Started cloud supervisor for remote url (%r). "
                       "Function payload size is %s.",
-                      self.cloud_url_base, fmt_bytes(len(self.encoded_func)))
+                      self.cloud_url_base, fmt_bytes(len(self.func_payload)))
 
     def init_remote(self):
         """
@@ -1359,26 +1428,36 @@ class _CloudSupervisor(multiprocessing.Process):
         req_dict['func_hash'] = self.func_hash
         url = self.cloud_url_base + "/api/v1/init"
         payload = msgpack.dumps(req_dict)
-        headers = create_headers(self.secret, payload, self.label, self.run_id)
-        resp = post_request(url, data=payload, headers=headers)
+        headers = basic_headers(self.secret, payload)
+        resp = post_request(url, payload, headers)
+        print("made remote init req")
 
         if resp.status_code != 200:
-            raise CloudError("Cloud initialization failed %r" % resp.content)
+            raise CloudError("Cloud initialization failed %r." % resp.content)
         if msgpack.loads(resp.content).get('existence'):
+            print("exist and ret")
             return
+        print("not exist")
 
         # Step 2: If the server can't find the func, we need to upload it
-        req_dict['func'] = self.encoded_func
-        req_dict['modules'] = self.encoded_modules
+        req_dict['func'] = self.func_payload
         payload = msgpack.dumps(req_dict)
-        headers = create_headers(self.secret, payload, self.label, self.run_id)
-        resp = post_request(url, data=payload, headers=headers)
 
-        if resp.status_code != 200:
-            raise CloudError("Cloud initialization failed %r" % resp.content)
-        if msgpack.loads(resp.content).get('created'):
-            return
-        raise CloudError("Cloud initialization failed. Function not uploaded")
+        payload_parts = chunk_bytes(payload, 30 * MB)
+        for i, payload in enumerate(payload_parts):
+            headers = basic_headers(self.secret, payload)
+            headers['X-Payload-Part'] = str(i)
+            headers['X-Payload-Len'] = str(len(payload_parts))
+            print('loopa')
+            resp = post_request(url, payload, headers)
+            print('loopb')
+
+            if resp.status_code != 200:
+                raise CloudError("Cloud initialization failed %r." % msgpack.loads(resp.content))
+            if msgpack.loads(resp.content).get('created'):
+                print('ret')
+                return
+            raise CloudError("Cloud initialization failed. Function not uploaded.")
 
     def run(self):
         """
@@ -1386,35 +1465,39 @@ class _CloudSupervisor(multiprocessing.Process):
         cloud-only errors. If that one works, open a number of threads to
         push more to the cloud.
         """
-        threads = []
+        try:
+            self.init_remote()
+        except CloudError as e:
+            self.log.error("In cloud supervisor during init [%s]: %r.",
+                           multiprocessing.current_process().name, e)
+            return
 
         batch_tup = self.itdm.checkout()
         if not batch_tup:
             return
 
-        self.init_remote()
-
-        url = self.cloud_url_base + '/api/v1/map'
-
+        map_endpoint = self.cloud_url_base + '/api/v1/map'
         try:
-            process_cloud_batch(self.itdm, batch_tup, url, self.func_hash, self.label,
+            process_cloud_batch(self.itdm, batch_tup, map_endpoint,
+                                self.func_hash, self.label,
                                 self.run_id, self.secret, self.log)
         except CloudError as e:
             self.itdm.put_error(self.process_name, repr(e), batch_tup)
             if hasattr(e, 'tb') and e.tb:
-                self.log.error("In cloud supervisor [%s]:\n%s",
+                self.log.error("In cloud supervisor [%s]:\n%s.",
                                multiprocessing.current_process().name, e.tb)
             else:
-                self.log.error("In cloud supervisor [%s]: %r",
+                self.log.error("In cloud supervisor [%s]: %r.",
                                multiprocessing.current_process().name, e)
             return
 
-        num_cloud_threads = min(self.max_cloud_connections,
+        threads = []
+        num_cloud_threads = min(self.max_cloud_workers,
                                 self.itdm.inbox_len())
-        self.log.debug("Opening %d cloud connection(s)", num_cloud_threads)
+        self.log.debug("Opening %d cloud connection(s)...", num_cloud_threads)
         for thread_id in range(num_cloud_threads):
-            thread_args = (thread_id, url, self.func_hash, self.label, self.run_id,
-                           self.itdm, self.secret, self.log)
+            thread_args = (thread_id, map_endpoint, self.func_hash, self.label,
+                           self.run_id, self.itdm, self.secret, self.log)
             thread = threading.Thread(target=cloud_thread, args=thread_args)
             thread.start()
             threads.append(thread)

@@ -433,9 +433,7 @@ def test_remote_no_connection(monkeypatch, capsys):
     with pytest.raises(EveryWorkerDead):
         list(config.fastmap(lambda x: x**.5, range_100))
     stdio = capsys.readouterr()
-    # assert re.search("could not connect", stdio.out)
-    print(stdio.out)
-    assert False
+    assert re.search("could not connect", stdio.out)
 
 
 def test_confirm_charges_basic(capsys, monkeypatch):
