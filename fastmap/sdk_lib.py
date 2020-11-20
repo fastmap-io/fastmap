@@ -4,9 +4,11 @@ Do not instantiate anything here directly. Use the interface __init__.py.
 """
 
 import distutils.sysconfig
+import glob
 import gzip
 import hashlib
 import hmac
+import importlib
 import multiprocessing
 import os
 import re
@@ -26,6 +28,7 @@ CLOUD_URL_BASE = 'https://fastmap.io'
 DEFAULT_MAX_CLOUD_WORKERS = 5
 SECRET_LEN = 64
 SECRET_RE = r'^[0-9a-z]{64}$'
+SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
 EXECUTION_ENV = "LOCAL"
 CLIENT_VERSION = "0.0.4"
 UNSUPPORTED_TYPE_STRS = ('numpy', 'pandas')
@@ -771,6 +774,72 @@ def get_module_source() -> bytes:  # noqa
     return module_source
 
 
+def get_requirements(installed_modules):
+    imported_module_names = set()
+    site_packages_dirs = set()
+    for mod in installed_modules:
+        imported_module_names.add(mod.__package__.split('.', 1)[0])
+        site_packages_dirs.add(SITE_PACKAGES_RE.match(mod.__file__).group(0))
+
+    top_level_files = set()
+    for site_packages_dir in site_packages_dirs:
+        top_level_path = site_packages_dir + "*.dist-info/top_level.txt"
+        top_level_files.update(glob.glob(top_level_path))
+
+    packages_by_module = {}
+    for fn in top_level_files:
+        with open(fn) as f:
+            modules = f.read().split('\n')
+        metadata_fn = fn.rsplit('/', 1)[0] + '/METADATA'
+        pkg_name = None
+        with open(metadata_fn) as f:
+            for row in f.readlines():
+                if match := re.match(r"Name: (?P<pkg_name>[a-zA-Z0-9-]+)", row):
+                    pkg_name = match['pkg_name']
+                    break
+        if not pkg_name:
+            raise AssertionError("No package name for %r" % fn)
+        for mod_name in modules:
+            packages_by_module[mod_name] = pkg_name
+
+    requirements = []
+    for mod_name in imported_module_names:
+        pkg_name = packages_by_module[mod_name]
+        pkg_version = importlib.metadata.version(pkg_name)
+        requirements.append(pkg_name + "==" + pkg_version)
+
+    return requirements
+
+
+def generate_mod_payload(log):
+    std_lib_dir = distutils.sysconfig.get_python_lib(standard_lib=True)
+    local_module_source = {}
+    installed_modules = []
+    for mod_name, mod in sys.modules.items():
+        if (mod_name in sys.builtin_module_names or  # not builtin # noqa
+            mod_name.startswith("_") or  # not hidden # noqa
+            not getattr(mod, '__file__', None) or   # also not builtin # noqa
+            mod.__file__.startswith(std_lib_dir) or  # not stdlib # noqa
+            (hasattr(mod, "__package__") and  # noqa
+             mod.__package__ in ("fastmap", "fastmap.fastmap"))):  # not fastmap
+                continue  # noqa
+        if SITE_PACKAGES_RE.match(mod.__file__):
+            installed_modules.append(mod)
+        if not mod.__file__.endswith('.py'):
+            # locally built non-python dependencies can't go up. Warn about this
+            log.warning("Unable to remotely process local dependency %r", mod)
+            continue
+        with open(mod.__file__) as f:
+            source = f.read()
+        local_module_source[mod.__name__] = source
+
+    requirements = get_requirements(installed_modules)
+    return {
+        "local_modules": local_module_source,
+        "requirements": requirements,
+    }
+
+
 def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
               func_hash: str, run_id: str) -> None:
     """
@@ -1400,10 +1469,12 @@ class _CloudSupervisor(multiprocessing.Process):
         multiprocessing.Process.__init__(self)
         encoded_func = msgpack.dumps({
             'func': pickled_func,
-            'modules': get_module_source()})
+            'dependencies': generate_mod_payload(config.log)})
         self.func_payload = gzip.compress(encoded_func, compresslevel=1)
         self.func_hash = get_func_hash(self.func_payload)
         self.itdm = itdm
+
+
         self.log = config.log
         self.max_cloud_workers = config.max_cloud_workers
         self.cloud_url_base = config.cloud_url_base
