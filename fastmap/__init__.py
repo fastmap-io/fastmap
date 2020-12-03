@@ -1,11 +1,11 @@
 from .sdk_lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity,
-                      EveryWorkerDead, ReturnType, CLIENT_VERSION, INIT_DOCSTRING,
+                      FastmapException, ReturnType, CLIENT_VERSION, INIT_DOCSTRING,
                       GLOBAL_INIT_DOCSTRING, FASTMAP_DOCSTRING)
 
 ExecPolicy = ExecPolicy
 Verbosity = Verbosity
 ReturnType = ReturnType
-EveryWorkerDead = EveryWorkerDead
+FastmapException = FastmapException
 FastmapConfig = FastmapConfig
 
 __version__ = CLIENT_VERSION

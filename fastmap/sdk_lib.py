@@ -8,7 +8,7 @@ import glob
 import gzip
 import hashlib
 import hmac
-import importlib
+import importlib.metadata
 import multiprocessing
 import os
 import re
@@ -18,7 +18,8 @@ import threading
 import time
 import traceback
 from collections.abc import Iterable, Sequence, Generator
-from types import FunctionType
+from types import FunctionType, ModuleType
+from typing import List, Dict
 
 import dill
 import msgpack
@@ -212,7 +213,7 @@ def get_func_hash(pickled_func: bytes) -> str:
     return hashlib.sha256(pickled_func).hexdigest()[:16]
 
 
-class EveryWorkerDead(Exception):
+class FastmapException(Exception):
     """
     Thrown when something goes wrong running the user's code on the
     cloud or on separate processes.
@@ -321,7 +322,7 @@ class FastmapLogger():
             self.info = self._do_nothing
             self.warning = self._do_nothing
         else:
-            raise AssertionError(f"Unknown verbosity '{self.verbosity}'")
+            raise FastmapException(f"Unknown verbosity '{self.verbosity}'")
 
     def hush(self):
         self.debug = self._do_nothing  # noqa
@@ -510,7 +511,7 @@ class InterThreadDataManager():
                     return self._outbox.pop(0)
             if not any(w.is_alive() for w in workers):
                 ex_str = "While trying to get next processed element"
-                raise EveryWorkerDead(ex_str)
+                raise FastmapException(ex_str)
             time.sleep(.01)
 
 
@@ -568,45 +569,54 @@ def basic_headers(secret: str, payload: bytes) -> dict:
     }
 
 
-def map_headers(secret: str, payload: bytes,
-                label: str, run_id: str) -> dict:
-    """Get headers for communicating with the fastmap.io cloud service"""
-    headers = basic_headers(secret, payload)
-    headers['X-Label'] = label
-    headers['X-Run-ID'] = run_id
-    return headers
+# def map_headers(secret: str, payload: bytes,
+#                 label: str, run_id: str) -> dict:
+#     """Get headers for communicating with the fastmap.io cloud service"""
+#     headers = basic_headers(secret, payload)
+#     headers['X-Label'] = label
+#     headers['X-Run-ID'] = run_id
+#     return headers
 
 
-def post_request(url: str, data: bytes, headers: dict) -> requests.Response:
+def post_request(url: str, data: bytes, headers: dict, log: FastmapLogger,
+                 secret=None) -> requests.Response:
     """Since we have the same error handler around every post"""
     try:
-        return requests.post(url, data=data, headers=headers)
+        resp = requests.post(url, data=data, headers=headers)
     except requests.exceptions.ConnectionError:
         raise CloudError("Fastmap could not connect to %r. "
                          "Check your connection." % url) from None
+    if 'X-Server-Warning' in resp.headers:
+        # deprecations or anything else
+        log.warning(resp.headers['X-Server-Warning'])
 
+    if resp.status_code == 500:
+        raise CloudError("Fastmap cloud error: %r" % resp.content)
 
-def check_unpickle_resp(resp: requests.Response, secret: str) -> dict:
-    """
-    The server returns data encoded with msgpack. If we are getting a response
-    back with results in it, we also check the hmac for integrity.
-    Processed batches or "results", are additionally pickled and compressed.
-    """
-    try:
-        resp_dict = msgpack.loads(resp.content)
-    except Exception:
-        # msgpack recommends catching all Exception instead of something
-        # specific
-        raise CloudError("Could not decode resp %r" % resp.content)
-    if 'results' in resp_dict:
+    if resp.headers.get('Content-Type') == 'application/msgpack':
+        resp.obj = msgpack.loads(resp.content)
+        resp.status = resp.obj['status']
+    elif resp.headers.get('Content-Type') == 'application/octet-stream':
         if 'X-Content-Signature' not in resp.headers:
             raise CloudError("Cloud payload was not signed (%d). "
                              "Will not unpickle." % (resp.status_code))
         cloud_hash = hmac_digest(secret, resp.content)
         if resp.headers['X-Content-Signature'] != cloud_hash:
             raise CloudError("Cloud checksum did not match. Will not unpickle.")
-        resp_dict['results'] = dill.loads(gzip.decompress(resp_dict['results']))
-    return resp_dict
+        resp.status = resp.headers['X-Status']
+        try:
+            resp.obj = dill.loads(gzip.decompress(resp.content))
+        except gzip.BadGzipFile:
+            raise CloudError("Error unzipping response") from None
+        except dill.UnpicklingError:
+            raise CloudError("Error unpickling response") from None
+    else:
+        raise CloudError("Unexpected Content-Type %r (%d): %r" %
+                         (resp.headers.get("Content-Type"),
+                          resp.status_code,
+                          resp.content))
+
+    return resp
 
 
 def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
@@ -629,81 +639,86 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
     compressed_batch = gzip.compress(pickled_batch, compresslevel=1)
     req_dict = {
         'func_hash': func_hash,
-        'batch': compressed_batch
+        'batch': compressed_batch,
+        'label': label,
+        'run_id': run_id,
     }
     payload = msgpack.dumps(req_dict)
 
-    headers = map_headers(secret, payload, label, run_id)
-    log.debug("Making cloud request len=%d size=%s (%s/el)...",
-              len(batch), fmt_bytes(len(compressed_batch)),
-              fmt_bytes(len(compressed_batch) / len(batch)))
+    headers = basic_headers(secret, payload)
 
     while True:
-        print('post req proc')
-        resp = post_request(url, payload, headers)
-        print('post req proc 2')
-        if resp.status_code == 200 and msgpack.loads(resp.content).get('retry'):
-            log.debug("No cloud workers ready. Retrying in 5 seconds...")
-            time.sleep(5)
-            continue
+        log.debug("Making cloud request batchlen=%d size=%s (%s/el)...",
+                  len(batch), fmt_bytes(len(compressed_batch)),
+                  fmt_bytes(len(compressed_batch) / len(batch)))
+        resp = post_request(url, payload, headers, log, secret=secret)
+        if resp.status_code == 200:
+            if resp.status == "CREATING_WORKER":
+                log.debug("No cloud workers available. Retrying in 5 seconds...")
+                time.sleep(5)
+                continue
+            elif resp.status == "INIT_WORKER":
+                log.debug("Cloud worker is initializing [%s] (%.1f%%)."
+                          " Retrying in 5 seconds..." %
+                          (resp.obj.get('init_step', ''),
+                           float(resp.obj.get('init_progress', 0.0)) * 100))
+                time.sleep(5)
+                continue
+            elif resp.status == "INIT_WORKER_ERROR":
+                raise CloudError("Error initializing worker %r" %
+                                 resp.obj.get('init_error'))
         break
-    if resp.status_code == 200:
-        print('stat code 200')
-        resp_dict = check_unpickle_resp(resp, secret)
-        results = resp_dict['results']
-        cloud_cid = resp.headers['X-Container-Id']
-        worker_cid = resp.headers['X-Worker-Id']
-        if 'X-Server-Warning' in resp.headers:
-            # deprecations or anything else
-            log.warning(resp.headers['X-Server-Warning'])
 
+    if resp.status == "BATCH_PROCESSED":
+        cloud_cid = resp.headers['X-Controller-Id']
+        worker_cid = resp.headers['X-Worker-Id']
         total_request = time.perf_counter() - start_req_time
         total_application = float(resp.headers['X-Application-Seconds'])
         total_mapping = float(resp.headers['X-Map-Seconds'])
         credits_used = float(resp.headers['X-Credits'])
-        req_time_per_el = total_request / len(results)
-        app_time_per_el = total_application / len(results)
-        map_time_per_el = total_mapping / len(results)
+        result_len = len(resp.obj['results'])
+        req_time_per_el = total_request / result_len
+        app_time_per_el = total_application / result_len
+        map_time_per_el = total_mapping / result_len
 
         log.debug("Batch %d cloud cnt=%d "
                   "%.2fs/%.2fs/%.2fs map/app/req (%.2e/%.2e/%.2e per el) "
                   "[%s/%s].",
-                  batch_idx, len(results),
+                  batch_idx, result_len,
                   total_mapping, total_application, total_request,
                   map_time_per_el, app_time_per_el, req_time_per_el,
                   cloud_cid, worker_cid)
         itdm.push_outbox(batch_idx,
-                         results,
+                         resp.obj['results'],
                          None,
                          credits_used=credits_used,
                          network_seconds=total_request - total_application)
         return
 
-    if resp.status_code == 400:
+    if resp.status == "INTERNAL_FASTMAP_ERROR":
+        raise CloudError("Unexpected cloud error. Try again later.")
+    if resp.status == "WORKER_EXECUTION_ERROR":
         # ERROR
-        resp_out = check_unpickle_resp(resp, secret)
         msg = "Your code could not be processed on the cloud: %r" % \
-            resp_out['exception']
-        bad_modules = resp_out.get('bad_modules', [])
+            resp.obj.get('exception')
+        bad_modules = resp.obj.get('bad_modules', [])
         if bad_modules:
             msg += " Modules with errors on import: %r" % bad_modules
-        raise CloudError(msg, tb=resp_out.get('traceback', ''))
+        raise CloudError(msg, tb=resp.obj.get('traceback', ''))
     if resp.status_code == 401:
         # UNAUTHORIZED
         raise CloudError("Unauthorized. Check your API token.")
     if resp.status_code == 402:
         # NOT_ENOUGH_CREDITS
-        resp_out = check_unpickle_resp(resp, secret)
         raise CloudError("Insufficient credits for this request. "
                          "Your current balance is $%.4f." %
-                         resp_out.get('credits_used', 0) / 100)
+                         resp.obj.get('credits_used', 0) / 100)
     if resp.status_code == 403:
         # INVALID_SIGNATURE
-        raise CloudError(check_unpickle_resp(resp, secret))
+        raise CloudError("Invalid signature. Check your token")
     if resp.status_code == 410:
         # DISCONTINUED (post-deprecated end-of-life)
-        resp_out = check_unpickle_resp(resp, secret)
-        raise CloudError("Fastmap.io error: %r" % resp_out['reason'])
+        raise CloudError("Fastmap.io API discontinued: %r" % resp.obj.get('reason'))
     if resp.status_code == 413:
         # TOO_LARGE
         raise CloudError("Your request was too large (%s). "
@@ -711,12 +726,8 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
                          "function and try again." % fmt_bytes(len(payload)))
 
     # catch all (should just be for 500s of which a few are explicitly defined)
-    try:
-        resp_out = check_unpickle_resp(resp, secret)
-    except (CloudError, dill.UnpicklingError):
-        resp_out = resp.content
-    raise CloudError("Unexpected cloud error %d %r" %
-                     (resp.status_code, resp_out))
+    raise CloudError("Unexpected cloud response %d %s %r" %
+                     (resp.status_code, resp.status, resp.obj))
 
 
 def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
@@ -750,35 +761,52 @@ def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
         batch_tup = itdm.checkout()
 
 
-def get_module_source() -> bytes:  # noqa
+def get_modules(log: FastmapLogger) -> (Dict[str, str], List[ModuleType]):
     """
-    Gather the source for all local modules and pickle them for the cloud.
+    From sys.modules, return the source of local modules and a list of
+    other modules
     """
-    site_packages_re = re.compile(r"\/python[0-9.]+\/(?:site|dist)\-packages\/")
     std_lib_dir = distutils.sysconfig.get_python_lib(standard_lib=True)
-    module_source = {}
+    local_module_sources = {}
+    installed_modules = []
     for mod_name, mod in sys.modules.items():
         if (mod_name in sys.builtin_module_names or  # not builtin # noqa
             mod_name.startswith("_") or  # not hidden # noqa
             not getattr(mod, '__file__', None) or   # also not builtin # noqa
             mod.__file__.startswith(std_lib_dir) or  # not stdlib # noqa
-            not mod.__file__.endswith('.py') or  # not c adapter # noqa
-            site_packages_re.search(mod.__file__) or  # not installed # noqa
             (hasattr(mod, "__package__") and  # noqa
              mod.__package__ in ("fastmap", "fastmap.fastmap"))):  # not fastmap
-                # TODO, eventually bring in site_packages as well # noqa
                 continue  # noqa
+        if SITE_PACKAGES_RE.match(mod.__file__):
+            installed_modules.append(mod)
+            continue
+        if not mod.__file__.endswith('.py'):
+            # locally built non-python dependencies can't go up. Warn about this
+            # TODO these are not python dependencies
+            log.warning("The module %r is a non-Python locally-built module "
+                        "which unfortunately cannot be uploaded.", mod)
+            continue
         with open(mod.__file__) as f:
             source = f.read()
-        module_source[mod.__name__] = source
-    return module_source
+            if source:
+                local_module_sources[mod.__name__] = source
+
+    return local_module_sources, installed_modules
 
 
-def get_requirements(installed_modules):
+def get_requirements(installed_modules: List[ModuleType],
+                     log: FastmapLogger) -> List[str]:
+    """
+    Get pip installed requirements which are loaded into the
+    """
     imported_module_names = set()
     site_packages_dirs = set()
     for mod in installed_modules:
-        imported_module_names.add(mod.__package__.split('.', 1)[0])
+        try:
+            imported_module_names.add(mod.__package__.split('.', 1)[0])
+        except Exception:
+            log.warning("Module %r had no package. This may cause problems "
+                        "when executing in the cloud.", mod)
         site_packages_dirs.add(SITE_PACKAGES_RE.match(mod.__file__).group(0))
 
     top_level_files = set()
@@ -798,46 +826,31 @@ def get_requirements(installed_modules):
                     pkg_name = match['pkg_name']
                     break
         if not pkg_name:
-            raise AssertionError("No package name for %r" % fn)
+            raise FastmapException("No package name for %r" % fn)
         for mod_name in modules:
             packages_by_module[mod_name] = pkg_name
 
-    requirements = []
+    requirements = {}
     for mod_name in imported_module_names:
         pkg_name = packages_by_module[mod_name]
         pkg_version = importlib.metadata.version(pkg_name)
-        requirements.append(pkg_name + "==" + pkg_version)
+        requirements[pkg_name] = pkg_name + "==" + pkg_version
 
     return requirements
 
 
-def generate_mod_payload(log):
-    std_lib_dir = distutils.sysconfig.get_python_lib(standard_lib=True)
-    local_module_source = {}
-    installed_modules = []
-    for mod_name, mod in sys.modules.items():
-        if (mod_name in sys.builtin_module_names or  # not builtin # noqa
-            mod_name.startswith("_") or  # not hidden # noqa
-            not getattr(mod, '__file__', None) or   # also not builtin # noqa
-            mod.__file__.startswith(std_lib_dir) or  # not stdlib # noqa
-            (hasattr(mod, "__package__") and  # noqa
-             mod.__package__ in ("fastmap", "fastmap.fastmap"))):  # not fastmap
-                continue  # noqa
-        if SITE_PACKAGES_RE.match(mod.__file__):
-            installed_modules.append(mod)
-        if not mod.__file__.endswith('.py'):
-            # locally built non-python dependencies can't go up. Warn about this
-            log.warning("Unable to remotely process local dependency %r", mod)
-            continue
-        with open(mod.__file__) as f:
-            source = f.read()
-        local_module_source[mod.__name__] = source
+def get_dependencies(log: FastmapLogger):
+    local_module_sources, installed_modules = get_modules(log)
+    requirements = get_requirements(installed_modules, log)
 
-    requirements = get_requirements(installed_modules)
-    return {
-        "local_modules": local_module_source,
-        "requirements": requirements,
-    }
+    dependencies = {**local_module_sources, **requirements}
+
+    # TODO remove
+    # import pprint
+    # pprint.pprint({m: v and len(v) for m, v in dependencies.items()})
+    # print('\a'); import ipdb; ipdb.set_trace()
+
+    return dependencies
 
 
 def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
@@ -853,14 +866,11 @@ def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
         "run_id": run_id
     })
     headers = basic_headers(secret, payload)
-    try:
-        resp = post_request(url, payload, headers)
-    except CloudError:
-        log.error("Could not connect to /done endpoint.")
+    resp = post_request(url, payload, headers, log)
 
     if resp.status_code != 200:
         log.error("Error on final api call (%d) %r.",
-                  resp.status_code, resp.content)
+                  resp.status_code, resp.status)
 
 
 class _FillInbox(threading.Thread):
@@ -1004,28 +1014,22 @@ class AuthCheck(threading.Thread):
         payload = msgpack.dumps({})
         headers = basic_headers(self.secret, payload)
         try:
-            resp = post_request(self.url, payload, headers)
-        except CloudError:
-            self.log.warning("Cannot connect to %r. Check your network.",
-                             self.url)
+            resp = post_request(self.url, payload, headers, self.log)
+        except CloudError as ex:
+            self.log.error("During auth check [%s]:\n%s.",
+                           multiprocessing.current_process().name, ex)
             self.success = False
             return
         if resp.status_code != 200:
-            try:
-                resp_content = msgpack.loads(resp.content)
-            except Exception:
-                resp_content = resp.content
-            try:
-                resp_content = "%s (%s)" % (resp_content['status'],
-                                            resp_content['reason'])
-            except KeyError:
-                pass
-
             self.log.warning("Authentication failed for %r %r. ",
-                             self.url, resp_content)
+                             self.url, resp.status)
             self.success = False
         self.log.info("Request to %r was successful.", self.url)
         self.success = True
+
+    def was_success(self):
+        # exists for mocks
+        return self.success
 
 
 class Mapper():
@@ -1084,7 +1088,7 @@ class Mapper():
                 credit_estimate = get_credits(self.avg_runtime * len(iterable),
                                               self.avg_egress * len(iterable))
                 user_input_query = "Estimate: $%.4f. Continue?" % \
-                    credit_estimate / 100
+                    (credit_estimate / 100)
             else:
                 user_input_query = "Cannot estimate credit usage because " \
                                    "iterable is a generator. Continue anyway?"
@@ -1123,7 +1127,7 @@ class Mapper():
         except Exception as ex:
             func_name = getattr(func, "__name__", str(func))
             err = "Your function %r could not be pickled." % func_name
-            raise EveryWorkerDead(err) from ex
+            raise FastmapException(err) from ex
 
         workers = []
         if self.config.exec_policy != ExecPolicy.CLOUD:
@@ -1137,15 +1141,15 @@ class Mapper():
                            self.config.max_local_workers)
         if self.config.exec_policy != ExecPolicy.LOCAL:
             self.auth_check.join()
-            if self.auth_check.success and self._confirm_charges(iterable):
+            if self.auth_check.was_success() and self._confirm_charges(iterable):
                 cloud_supervisor = _CloudSupervisor(pickled_func, itdm,
                                                     self.config, label)
                 cloud_supervisor.start()
                 workers.append(cloud_supervisor)
 
         if not workers or not any(p.is_alive() for p in workers):
-            raise EveryWorkerDead("No execution workers started. "
-                                  "Try modifying your fastmap configuration.")
+            raise FastmapException("No execution workers started. "
+                                   "This was likely triggered by another error above.")
 
         return workers, itdm
 
@@ -1181,7 +1185,7 @@ class Mapper():
         try:
             size_egress = len(dill.dumps(ret))
         except Exception as ex:
-            raise EveryWorkerDead("Could not pickle your results.") from ex
+            raise FastmapException("Could not pickle your results.") from ex
         self.avg_runtime = first_batch_run_time / len_first_batch
         self.avg_egress = size_egress / len_first_batch
         self.log.debug("Processed first %d elements in %.2fs (%.2e/element).",
@@ -1294,7 +1298,7 @@ class FastmapConfig():
                  max_local_workers=None, cloud_url_base=CLOUD_URL_BASE,
                  max_cloud_workers=DEFAULT_MAX_CLOUD_WORKERS):
         if exec_policy not in ExecPolicy:
-            raise AssertionError(f"Unknown exec_policy '{exec_policy}'.")
+            raise FastmapException(f"Unknown exec_policy '{exec_policy}'.")
         self.exec_policy = exec_policy
         self.log = FastmapLogger(verbosity)
         self.verbosity = verbosity
@@ -1305,13 +1309,13 @@ class FastmapConfig():
         if multiprocessing.current_process().name != "MainProcess":
             # Fixes issue with multiple loud inits during local multiprocessing
             # in Mac / Windows
-            # TODO: I don't recall why this was needed and can't seem to make
-            # a test case. Possible removal candidate...
+            # TODO: I can't seem to make a test case.
+            # Possible removal candidate...
             self.log.hush()
 
         if secret:
-            if not re.match(SECRET_RE, secret):
-                raise AssertionError("Invalid secret token.")
+            if not isinstance(secret, str) or not re.match(SECRET_RE, secret):
+                raise FastmapException("Invalid secret token.")
             self.secret = secret
         else:
             self.secret = None
@@ -1348,7 +1352,7 @@ class FastmapConfig():
         handler for errors and exception
         """
         if return_type not in ReturnType:
-            raise AssertionError(f"Unknown return_type '{return_type}'")
+            raise FastmapException(f"Unknown return_type '{return_type}'")
         iter_type = str(type(iterable))
         if any(t in iter_type for t in UNSUPPORTED_TYPE_STRS):
             self.log.warning(f"Type '{iter_type}' is explicitly not supported.")
@@ -1403,15 +1407,15 @@ class FastmapConfig():
                     pass
             mapper.cleanup()
 
-            if not errors or not isinstance(e, EveryWorkerDead):
-                raise e
+            if not errors or not isinstance(e, FastmapException):
+                raise e from None
 
         if errors:
             error_msg = "Every execution worker died. List of errors:"
             for error in errors:
                 error_msg += "\n  " + error
             self.log.error(error_msg)
-            raise EveryWorkerDead(error_msg)
+            raise FastmapException(error_msg)
 
         total_dur = time.perf_counter() - start_time
         self._log_final_stats(func_name(func), mapper, proc_cnt,
@@ -1457,7 +1461,7 @@ class FastmapConfig():
 
 
 def chunk_bytes(payload: bytes, size: int) -> list:
-    return [payload[i:i+size] for i in range(0, len(payload), size)]
+    return [payload[i:i + size] for i in range(0, len(payload), size)]
 
 
 class _CloudSupervisor(multiprocessing.Process):
@@ -1469,11 +1473,10 @@ class _CloudSupervisor(multiprocessing.Process):
         multiprocessing.Process.__init__(self)
         encoded_func = msgpack.dumps({
             'func': pickled_func,
-            'dependencies': generate_mod_payload(config.log)})
+            'dependencies': get_dependencies(config.log)})
         self.func_payload = gzip.compress(encoded_func, compresslevel=1)
         self.func_hash = get_func_hash(self.func_payload)
         self.itdm = itdm
-
 
         self.log = config.log
         self.max_cloud_workers = config.max_cloud_workers
@@ -1500,35 +1503,30 @@ class _CloudSupervisor(multiprocessing.Process):
         url = self.cloud_url_base + "/api/v1/init"
         payload = msgpack.dumps(req_dict)
         headers = basic_headers(self.secret, payload)
-        resp = post_request(url, payload, headers)
-        print("made remote init req")
+        resp = post_request(url, payload, headers, self.log)
 
         if resp.status_code != 200:
-            raise CloudError("Cloud initialization failed %r." % resp.content)
-        if msgpack.loads(resp.content).get('existence'):
-            print("exist and ret")
+            raise CloudError("Cloud initialization failed %r." % resp.obj)
+        if resp.status == 'EXISTS':
             return
-        print("not exist")
 
         # Step 2: If the server can't find the func, we need to upload it
-        req_dict['func'] = self.func_payload
-        payload = msgpack.dumps(req_dict)
-
-        payload_parts = chunk_bytes(payload, 30 * MB)
-        for i, payload in enumerate(payload_parts):
+        # We might need to chunk the upload due to cloud run limits
+        func_parts = chunk_bytes(self.func_payload, 20 * MB)
+        for i, func_part in enumerate(func_parts):
+            req_dict['func'] = func_part
+            req_dict['payload_part'] = i
+            req_dict['payload_len'] = len(func_parts)
+            payload = msgpack.dumps(req_dict)
             headers = basic_headers(self.secret, payload)
-            headers['X-Payload-Part'] = str(i)
-            headers['X-Payload-Len'] = str(len(payload_parts))
-            print('loopa')
-            resp = post_request(url, payload, headers)
-            print('loopb')
+            resp = post_request(url, payload, headers, self.log)
 
             if resp.status_code != 200:
-                raise CloudError("Cloud initialization failed %r." % msgpack.loads(resp.content))
-            if msgpack.loads(resp.content).get('created'):
-                print('ret')
-                return
+                raise CloudError("Cloud initialization failed %r." % resp.obj)
+            if resp.status == 'UPLOADED':
+                continue
             raise CloudError("Cloud initialization failed. Function not uploaded.")
+        return
 
     def run(self):
         """

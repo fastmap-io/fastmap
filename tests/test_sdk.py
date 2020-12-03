@@ -15,7 +15,7 @@ import pytest
 sys.path.append(os.getcwd().split('/tests')[0])
 
 from fastmap import (init, global_init, fastmap, _reset_global_config,
-                     EveryWorkerDead, sdk_lib, FastmapConfig, ReturnType,
+                     FastmapException, sdk_lib, FastmapConfig, ReturnType,
                      Verbosity, ExecPolicy)
 # from fastmap.lib import FastmapConfig
 
@@ -109,7 +109,7 @@ def test_return_type_seq():
 
     for verbosity in ("QUIET", "NORMAL"):
         config = init(exec_policy="LOCAL", verbosity=verbosity)
-        with pytest.raises(AssertionError):
+        with pytest.raises(FastmapException):
             list(config.fastmap(lambda x: x**.5, [], return_type="FAKE_RETURN_TYPE"))
 
 
@@ -224,13 +224,13 @@ def test_local_functools():
     assert pi == 3.12
 
 
-def test_local_processes():
-    config = init(exec_policy="LOCAL", local_processes=2)
+def test_max_local_workers():
+    config = init(exec_policy="LOCAL", max_local_workers=2)
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, range(100))) / len(range(100))
     assert pi == 3.12
 
-    # To get into local_processes <= 1
-    config = init(exec_policy="LOCAL", local_processes=1)
+    # To get into max_local_workers <= 1
+    config = init(exec_policy="LOCAL", max_local_workers=1)
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, range(100))) / len(range(100))
     assert pi == 3.12
 
@@ -241,7 +241,7 @@ def test_exec_policy():
     assert ExecPolicy.ADAPTIVE == "ADAPTIVE"
     assert set(ExecPolicy) == set(("LOCAL", "ADAPTIVE", "CLOUD"))
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(FastmapException):
         init(exec_policy="INVALID")
     for exec_policy in ("LOCAL", "CLOUD", "ADAPTIVE"):
         init(exec_policy=exec_policy)
@@ -275,7 +275,7 @@ def test_verbosity(capsys):
     stdio = capsys.readouterr()
     assert "fastmap DEBUG:" in stdio.out
     assert "fastmap INFO:" in stdio.out
-    with pytest.raises(AssertionError):
+    with pytest.raises(FastmapException):
         config = init(exec_policy="LOCAL", verbosity="FAKE")
 
 
@@ -351,7 +351,7 @@ def test_process_local(monkeypatch):
 
 
 def test_single_threaded_process(capsys, monkeypatch):
-    config = init(exec_policy="LOCAL", local_processes=1)
+    config = init(exec_policy="LOCAL", max_local_workers=1)
     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
     range_100 = range(100)
@@ -360,7 +360,7 @@ def test_single_threaded_process(capsys, monkeypatch):
 
 
 def test_single_threaded_process_exception(capsys, monkeypatch):
-    config = init(exec_policy="LOCAL", local_processes=1)
+    config = init(exec_policy="LOCAL", max_local_workers=1)
     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
     with pytest.raises(AssertionError):
@@ -368,10 +368,10 @@ def test_single_threaded_process_exception(capsys, monkeypatch):
 
 
 def test_process_exception(capsys, monkeypatch):
-    config = init(exec_policy="LOCAL", local_processes=2)
+    config = init(exec_policy="LOCAL", max_local_workers=2)
     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
-    with pytest.raises(EveryWorkerDead):
+    with pytest.raises(FastmapException):
         list(config.fastmap(calc_pi_dead_99, range(100)))
 
 
@@ -397,9 +397,9 @@ def test_slow_generator():
     assert pi == 3.12
 
     # test the do_die in the _FillInbox generators
-    with pytest.raises(EveryWorkerDead):
+    with pytest.raises(FastmapException):
         sum(config.fastmap(lambda x: 1 / (x - 50), slow_gen(range(100))))
-    with pytest.raises(EveryWorkerDead):
+    with pytest.raises(FastmapException):
         sum(config.fastmap(lambda x: 1 / (x - 50), slow_gen(list(range(100)))))
 
 
@@ -430,16 +430,24 @@ def test_remote_no_connection(monkeypatch, capsys):
     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
     range_100 = range(100)
-    with pytest.raises(EveryWorkerDead):
+    with pytest.raises(FastmapException):
         list(config.fastmap(lambda x: x**.5, range_100))
     stdio = capsys.readouterr()
     assert re.search("could not connect", stdio.out)
 
 
+def test_invalid_token(capsys):
+    init(exec_policy="CLOUD", verbosity="LOUD", secret=None)
+    for bad_token in (5, "_" * 64, "a" * 63, "a" * 65):
+        with pytest.raises(FastmapException):
+            init(exec_policy="CLOUD", verbosity="LOUD", secret=bad_token)
+    init(exec_policy="CLOUD", verbosity="LOUD", secret="a"*64)
+
+
 def test_confirm_charges_basic(capsys, monkeypatch):
     # Basic local should not warn about confirming charges or any issues with
     # the secret
-    config = init(exec_policy="LOCAL", local_processes=2)
+    config = init(exec_policy="LOCAL", max_local_workers=2)
     stdio = capsys.readouterr()
     assert not re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert not re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
@@ -448,7 +456,7 @@ def test_confirm_charges_basic(capsys, monkeypatch):
 
     # Basic cloud should warn about an absent secret and set execpolicy to local
     # (and say something about it)
-    config = init(exec_policy="CLOUD", local_processes=2)
+    config = init(exec_policy="CLOUD", max_local_workers=2)
     stdio = capsys.readouterr()
     assert not re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
@@ -456,14 +464,14 @@ def test_confirm_charges_basic(capsys, monkeypatch):
 
     # If a secret is correctly provided for cloud, warn about confirming
     # charges and do not set to local config policy
-    config = init(exec_policy="CLOUD", secret=TEST_SECRET, local_processes=2)
+    config = init(exec_policy="CLOUD", secret=TEST_SECRET, max_local_workers=2)
     stdio = capsys.readouterr()
     assert re.search("fastmap WARNING:.*?confirm_charges", stdio.out)
     assert not re.search("fastmap WARNING:.*?secret.*?LOCAL", stdio.out)
     assert config.exec_policy == "CLOUD"
 
     # If we set confirm charges, assert no warnings are thrown
-    config = init(exec_policy="CLOUD", secret=TEST_SECRET, confirm_charges=True, local_processes=2)
+    config = init(exec_policy="CLOUD", secret=TEST_SECRET, confirm_charges=True, max_local_workers=2)
     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
     monkeypatch.setattr(sdk_lib.FastmapLogger, "input", fake_input_no)
@@ -475,19 +483,19 @@ def test_confirm_charges_basic(capsys, monkeypatch):
 
     # Using the same config, ensure that every process dies with a fake url.
     # There should only be 1 process which can die
+    monkeypatch.setattr(sdk_lib.AuthCheck, "was_success", lambda _: True)
     config.cloud_url_base = "http://localhost:9999"
-    with pytest.raises(EveryWorkerDead):
+    with pytest.raises(FastmapException):
         list(config.fastmap(lambda x: x**.5, range(100)))
     stdio = capsys.readouterr()
     assert re.search(r"Continue\?", stdio.out)
-
-    with pytest.raises(EveryWorkerDead):
+    with pytest.raises(FastmapException):
         list(config.fastmap(lambda x: x**.5, iter(range(100))))
     stdio = capsys.readouterr()
     assert re.search(r"Continue anyway\?", stdio.out)
 
     # Adaptive should log cancelled
-    config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, confirm_charges=True, local_processes=2)
+    config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, confirm_charges=True, max_local_workers=2)
     config.cloud_url_base = "http://localhost:9999"
     list(config.fastmap(lambda x: x**.5, range(100)))
     stdio = capsys.readouterr()
@@ -564,7 +572,7 @@ def resp_headers():
 #     config = init(exec_policy="CLOUD", secret=TEST_SECRET)
 #     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
 #     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
-#     with pytest.raises(EveryWorkerDead):
+#     with pytest.raises(FastmapException):
 #         # Unauthorized will kill the cloud thread
 #         list(config.fastmap(sqrt, range(100)))
 #     stdio = capsys.readouterr()
@@ -580,7 +588,7 @@ def resp_headers():
 #     config = init(exec_policy="CLOUD", secret=TEST_SECRET)
 #     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
 #     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
-#     with pytest.raises(EveryWorkerDead):
+#     with pytest.raises(FastmapException):
 #         # Unauthorized will kill the cloud thread
 #         list(config.fastmap(sqrt, range(100)))
 #     stdio = capsys.readouterr()
@@ -595,7 +603,7 @@ def resp_headers():
 #     config = init(exec_policy="CLOUD", secret=TEST_SECRET)
 #     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
 #     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
-#     with pytest.raises(EveryWorkerDead):
+#     with pytest.raises(FastmapException):
 #         # Unauthorized will kill the cloud thread
 #         list(config.fastmap(sqrt, range(100)))
 #     stdio = capsys.readouterr()
@@ -681,6 +689,7 @@ def test_long_func(monkeypatch):
     list(config.fastmap(primeFactors, (BIG_NUM,)))
     list(config.fastmap(primeFactors, generator()))
 
+    monkeypatch.setattr(sdk_lib.AuthCheck, "was_success", lambda _: True)
     config = init(exec_policy="CLOUD", verbosity="LOUD", secret="0" * 64)
     list(config.fastmap(primeFactors, (BIG_NUM,)))
     list(config.fastmap(primeFactors, generator()))
