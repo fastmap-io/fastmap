@@ -1,4 +1,5 @@
 import base64
+import gzip
 import functools
 import io
 import math
@@ -10,7 +11,10 @@ import sys
 import time
 import types
 
+import dill
+import msgpack
 import pytest
+import requests_mock
 
 sys.path.append(os.getcwd().split('/tests')[0])
 
@@ -111,7 +115,6 @@ def test_return_type_seq():
         config = init(exec_policy="LOCAL", verbosity=verbosity)
         with pytest.raises(FastmapException):
             list(config.fastmap(lambda x: x**.5, [], return_type="FAKE_RETURN_TYPE"))
-
 
         seq = config.fastmap(lambda x: x**.5, [], return_type="BATCHES")
         assert isinstance(seq, types.GeneratorType)
@@ -608,6 +611,88 @@ def resp_headers():
 #         list(config.fastmap(sqrt, range(100)))
 #     stdio = capsys.readouterr()
 #     assert re.search("fastmap ERROR:.*?credits", stdio.out)
+
+def test_post_request(monkeypatch, capsys):
+    url = "localhost:8888/api/v1/map"
+    data = msgpack.dumps({"hello": "world"})
+    secret = "secret_token"
+    log = sdk_lib.FastmapLogger('QUIET')
+    resp_headers = {
+        "X-Status": "OK"
+    }
+    resp_dict = {
+        "world": "hello"
+    }
+
+    # Bad content type on API call
+    resp_headers['Content-Type'] = "text/html"
+    with requests_mock.Mocker() as m:
+        m.post(url, content=msgpack.dumps(resp_dict),
+               headers=resp_headers)
+        with pytest.raises(sdk_lib.CloudError):
+            sdk_lib.post_request(url, data, secret, log)
+
+    # Server warning and basic msgpack obj extraction
+    resp_headers['Content-Type'] = "application/msgpack"
+    resp_headers["X-Server-Warning"] = "abcdefg"
+    with requests_mock.Mocker() as m:
+        m.post(url, content=msgpack.dumps(resp_dict),
+               headers=resp_headers)
+        resp = sdk_lib.post_request(url, data, secret, log)
+        stdio = capsys.readouterr()
+        assert re.search("WARNING:[^\n]+ abcdefg", stdio.out)
+        assert resp.obj['world'] == 'hello'
+    del resp_headers["X-Server-Warning"]
+
+    # Cloud error on 500 status code
+    with requests_mock.Mocker() as m:
+        m.post(url, content=msgpack.dumps(resp_dict),
+               headers=resp_headers, status_code=500)
+        with pytest.raises(sdk_lib.CloudError):
+            sdk_lib.post_request(url, data, secret, log)
+
+    # No Content signature on octet-stream
+    resp_headers['Content-Type'] = "application/octet-stream"
+    pickled_resp = gzip.compress(dill.dumps(resp_dict))
+    with requests_mock.Mocker() as m:
+        m.post(url, content=pickled_resp,
+               headers=resp_headers)
+        with pytest.raises(sdk_lib.CloudError):
+            sdk_lib.post_request(url, data, secret, log)
+
+    # Wrong content signature on octet-stream
+    resp_headers['X-Content-Signature'] = "fake"
+    with requests_mock.Mocker() as m:
+        m.post(url, content=pickled_resp,
+               headers=resp_headers)
+        with pytest.raises(sdk_lib.CloudError):
+            sdk_lib.post_request(url, data, secret, log)
+
+    # Correct content signature. Extract works
+    resp_headers['X-Content-Signature'] = sdk_lib.hmac_digest(secret, pickled_resp)
+    with requests_mock.Mocker() as m:
+        m.post(url, content=pickled_resp,
+               headers=resp_headers)
+        resp = sdk_lib.post_request(url, data, secret, log)
+        assert resp.obj['world'] == 'hello'
+
+    # Not gzipped
+    pickled_resp = dill.dumps(resp_dict)
+    resp_headers['X-Content-Signature'] = sdk_lib.hmac_digest(secret, pickled_resp)
+    with requests_mock.Mocker() as m:
+        m.post(url, content=pickled_resp,
+               headers=resp_headers)
+        with pytest.raises(sdk_lib.CloudError):
+            sdk_lib.post_request(url, data, secret, log)
+
+    # Not msgpacked
+    pickled_resp = gzip.compress(str(resp_dict).encode())
+    resp_headers['X-Content-Signature'] = sdk_lib.hmac_digest(secret, pickled_resp)
+    with requests_mock.Mocker() as m:
+        m.post(url, content=pickled_resp,
+               headers=resp_headers)
+        with pytest.raises(sdk_lib.CloudError):
+            sdk_lib.post_request(url, data, secret, log)
 
 
 def test_fmt_bytes():

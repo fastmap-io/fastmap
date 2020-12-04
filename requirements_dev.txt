@@ -1,5 +1,6 @@
 # Client SDK dev requiremnets
 -r requirements.txt
 pytest>=6.0,<6.1
+requests-mock>=1.8.0,<2.0.0
 coverage>4.5,<4.6  # downgraded on purpose for --concurrency flag
 detect-secrets>=0.14,<0.15

@@ -83,6 +83,8 @@ INIT_PARAMS = """
         By default, fastmap will start num_cores * 2 - 2.
     :param int max_cloud_workers: Maximum number of cloud workers to start.
         By default, fastmap will start 5.
+    :param dict dependencies: Manually override dependency discovery.
+        See the docs to understand better.
     :param bool confirm_charges: Manually confirm cloud charges.
 
     For more documentation, go to https://fastmap.io/docs
@@ -205,10 +207,13 @@ def get_func_hash(pickled_func: bytes) -> str:
     The problem is that dill is not deterministic so if we just take a
     hash of the pickled function, we will get different values each time.
     For now, this is fine because we are basically using the hash for the
-    single run. In the future, we might need to make dill deterministic.
+    single run. In the future, we will need to make dill deterministic.
 
     To save time, don't try an approach with inspect.getsourcelines
     If upstream functions change, it won't capture the difference.
+
+    Approach will be to find non-deteministic aspects of Python and replace
+    them one-by-one in dill
     """
     return hashlib.sha256(pickled_func).hexdigest()[:16]
 
@@ -569,18 +574,14 @@ def basic_headers(secret: str, payload: bytes) -> dict:
     }
 
 
-# def map_headers(secret: str, payload: bytes,
-#                 label: str, run_id: str) -> dict:
-#     """Get headers for communicating with the fastmap.io cloud service"""
-#     headers = basic_headers(secret, payload)
-#     headers['X-Label'] = label
-#     headers['X-Run-ID'] = run_id
-#     return headers
-
-
-def post_request(url: str, data: bytes, headers: dict, log: FastmapLogger,
-                 secret=None) -> requests.Response:
-    """Since we have the same error handler around every post"""
+def post_request(url: str, data: bytes, secret: str,
+                 log: FastmapLogger) -> requests.Response:
+    """
+    Generic cloud post wrapper.
+    This does warning/error management, extracts content, and checks signatures
+    for every API post
+    """
+    headers = basic_headers(secret, data)
     try:
         resp = requests.post(url, data=data, headers=headers)
     except requests.exceptions.ConnectionError:
@@ -595,7 +596,7 @@ def post_request(url: str, data: bytes, headers: dict, log: FastmapLogger,
 
     if resp.headers.get('Content-Type') == 'application/msgpack':
         resp.obj = msgpack.loads(resp.content)
-        resp.status = resp.obj['status']
+        resp.status = resp.headers['X-Status']
     elif resp.headers.get('Content-Type') == 'application/octet-stream':
         if 'X-Content-Signature' not in resp.headers:
             raise CloudError("Cloud payload was not signed (%d). "
@@ -645,13 +646,11 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
     }
     payload = msgpack.dumps(req_dict)
 
-    headers = basic_headers(secret, payload)
-
     while True:
         log.debug("Making cloud request batchlen=%d size=%s (%s/el)...",
                   len(batch), fmt_bytes(len(compressed_batch)),
                   fmt_bytes(len(compressed_batch) / len(batch)))
-        resp = post_request(url, payload, headers, log, secret=secret)
+        resp = post_request(url, payload, secret, log)
         if resp.status_code == 200:
             if resp.status == "CREATING_WORKER":
                 log.debug("No cloud workers available. Retrying in 5 seconds...")
@@ -781,8 +780,6 @@ def get_modules(log: FastmapLogger) -> (Dict[str, str], List[ModuleType]):
             installed_modules.append(mod)
             continue
         if not mod.__file__.endswith('.py'):
-            # locally built non-python dependencies can't go up. Warn about this
-            # TODO these are not python dependencies
             log.warning("The module %r is a non-Python locally-built module "
                         "which unfortunately cannot be uploaded.", mod)
             continue
@@ -839,18 +836,15 @@ def get_requirements(installed_modules: List[ModuleType],
     return requirements
 
 
-def get_dependencies(log: FastmapLogger):
+def get_dependencies(log: FastmapLogger) -> Dict[str, str]:
+    """
+    Get dependency dictionary.
+    Keys are module names.
+    Values are either pip version strings or source code.
+    """
     local_module_sources, installed_modules = get_modules(log)
     requirements = get_requirements(installed_modules, log)
-
-    dependencies = {**local_module_sources, **requirements}
-
-    # TODO remove
-    # import pprint
-    # pprint.pprint({m: v and len(v) for m, v in dependencies.items()})
-    # print('\a'); import ipdb; ipdb.set_trace()
-
-    return dependencies
+    return {**local_module_sources, **requirements}
 
 
 def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
@@ -865,8 +859,7 @@ def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
         "func_hash": func_hash,
         "run_id": run_id
     })
-    headers = basic_headers(secret, payload)
-    resp = post_request(url, payload, headers, log)
+    resp = post_request(url, payload, secret, log)
 
     if resp.status_code != 200:
         log.error("Error on final api call (%d) %r.",
@@ -1012,9 +1005,8 @@ class AuthCheck(threading.Thread):
 
     def run(self):
         payload = msgpack.dumps({})
-        headers = basic_headers(self.secret, payload)
         try:
-            resp = post_request(self.url, payload, headers, self.log)
+            resp = post_request(self.url, payload, self.secret, self.log)
         except CloudError as ex:
             self.log.error("During auth check [%s]:\n%s.",
                            multiprocessing.current_process().name, ex)
@@ -1291,12 +1283,14 @@ class FastmapConfig():
         "max_local_workers",
         "max_cloud_workers",
         "cloud_url_base",
+        "dependencies",
     ]
 
     def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
                  exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
                  max_local_workers=None, cloud_url_base=CLOUD_URL_BASE,
-                 max_cloud_workers=DEFAULT_MAX_CLOUD_WORKERS):
+                 max_cloud_workers=DEFAULT_MAX_CLOUD_WORKERS,
+                 dependencies=None):
         if exec_policy not in ExecPolicy:
             raise FastmapException(f"Unknown exec_policy '{exec_policy}'.")
         self.exec_policy = exec_policy
@@ -1305,12 +1299,11 @@ class FastmapConfig():
         self.cloud_url_base = cloud_url_base
         self.confirm_charges = confirm_charges
         self.max_cloud_workers = max_cloud_workers
+        self.dependencies = dependencies
 
         if multiprocessing.current_process().name != "MainProcess":
             # Fixes issue with multiple loud inits during local multiprocessing
             # in Mac / Windows
-            # TODO: I can't seem to make a test case.
-            # Possible removal candidate...
             self.log.hush()
 
         if secret:
@@ -1323,6 +1316,9 @@ class FastmapConfig():
                 self.exec_policy = ExecPolicy.LOCAL
                 self.log.warning("No secret provided. "
                                  "Setting exec_policy to LOCAL.")
+
+        if dependencies is not None and not isinstance(dependencies, dict):
+            raise FastmapException("Invalid dependencies format.")
 
         if max_local_workers:
             self.max_local_workers = max_local_workers
@@ -1471,9 +1467,14 @@ class _CloudSupervisor(multiprocessing.Process):
     def __init__(self, pickled_func: bytes, itdm: InterThreadDataManager,
                  config: FastmapConfig, label: str):
         multiprocessing.Process.__init__(self)
+        if isinstance(config.dependencies, dict):
+            dependencies = config.dependencies
+        else:
+            dependencies = get_dependencies(config.log)
+
         encoded_func = msgpack.dumps({
             'func': pickled_func,
-            'dependencies': get_dependencies(config.log)})
+            'dependencies': dependencies})
         self.func_payload = gzip.compress(encoded_func, compresslevel=1)
         self.func_hash = get_func_hash(self.func_payload)
         self.itdm = itdm
@@ -1502,8 +1503,7 @@ class _CloudSupervisor(multiprocessing.Process):
         req_dict['func_hash'] = self.func_hash
         url = self.cloud_url_base + "/api/v1/init"
         payload = msgpack.dumps(req_dict)
-        headers = basic_headers(self.secret, payload)
-        resp = post_request(url, payload, headers, self.log)
+        resp = post_request(url, payload, self.secret, self.log)
 
         if resp.status_code != 200:
             raise CloudError("Cloud initialization failed %r." % resp.obj)
@@ -1518,8 +1518,7 @@ class _CloudSupervisor(multiprocessing.Process):
             req_dict['payload_part'] = i
             req_dict['payload_len'] = len(func_parts)
             payload = msgpack.dumps(req_dict)
-            headers = basic_headers(self.secret, payload)
-            resp = post_request(url, payload, headers, self.log)
+            resp = post_request(url, payload, self.secret, self.log)
 
             if resp.status_code != 200:
                 raise CloudError("Cloud initialization failed %r." % resp.obj)
