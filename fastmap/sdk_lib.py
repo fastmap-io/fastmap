@@ -615,7 +615,7 @@ def post_request(url: str, data: bytes, secret: str,
         raise CloudError("Unexpected Content-Type %r (%d): %r" %
                          (resp.headers.get("Content-Type"),
                           resp.status_code,
-                          resp.content))
+                          resp.content[:100].strip()))
 
     return resp
 
@@ -1012,11 +1012,12 @@ class AuthCheck(threading.Thread):
                            multiprocessing.current_process().name, ex)
             self.success = False
             return
-        if resp.status_code != 200:
-            self.log.warning("Authentication failed for %r %r. ",
+        if resp.status_code == 200:
+            self.log.info("Request to %r was successful.", self.url)
+        else:
+            self.log.warning("Authentication failed for %r %r. Check your token.",
                              self.url, resp.status)
             self.success = False
-        self.log.info("Request to %r was successful.", self.url)
         self.success = True
 
     def was_success(self):
