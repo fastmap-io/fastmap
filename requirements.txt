@@ -1,3 +1,4 @@
 # Client SDK requirements
 dill>=0.3.2,<0.4
+msgpack>=1.0.0,<1.1.0
 requests>=2.24,<3.0
