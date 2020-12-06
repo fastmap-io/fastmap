@@ -1,6 +1,7 @@
 from .sdk_lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity,
                       FastmapException, ReturnType, CLIENT_VERSION, INIT_DOCSTRING,
-                      GLOBAL_INIT_DOCSTRING, FASTMAP_DOCSTRING)
+                      GLOBAL_INIT_DOCSTRING, FASTMAP_DOCSTRING, OFFLOAD_DOCSTRING,
+                      POLL_DOCSTRING, KILL_DOCSTRING, RESULT_DOCSTRING)
 
 ExecPolicy = ExecPolicy
 Verbosity = Verbosity
@@ -23,15 +24,39 @@ def init(*args, **kwargs):
     return FastmapConfig(*args, **kwargs)
 
 
+def _get_config():
+    if _global_config:
+        return _global_config
+    tmp_config = init(exec_policy=ExecPolicy.LOCAL)
+    tmp_config.log.warning("Fastmap not initialized globally."
+                           "Defaulting to LOCAL exec_policy.")
+    return tmp_config
+
+
 @set_docstring(FASTMAP_DOCSTRING)
 def fastmap(func, iterable, *args, **kwargs):
-    if _global_config:
-        return _global_config.fastmap(func, iterable, *args, **kwargs)
-    else:
-        tmp_config = init(exec_policy=ExecPolicy.LOCAL)
-        tmp_config.log.warning("Fastmap not initialized globally."
-                               "Defaulting to LOCAL exec_policy.")
-        return tmp_config.fastmap(func, iterable, *args, **kwargs)
+    return _get_config().fastmap(func, iterable, *args, **kwargs)
+
+
+@set_docstring(OFFLOAD_DOCSTRING)
+def offload(func, *args, **kwargs):
+    return _get_config().offload(func, *args, **kwargs)
+
+
+@set_docstring(POLL_DOCSTRING)
+def poll(task_id):
+    return _get_config().poll(task_id)
+
+
+@set_docstring(KILL_DOCSTRING)
+def kill(task_id):
+    return _get_config().kill(task_id)
+
+
+@set_docstring(RESULT_DOCSTRING)
+def result(task_id):
+    return _get_config().result(task_id)
+
 
 
 def _reset_global_config():

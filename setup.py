@@ -29,6 +29,9 @@ setuptools.setup(
     url=url_base,
     download_url=download_url,
     packages=setuptools.find_packages(),
+    scripts=[
+        "scripts/fastmap",
+    ],
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
@@ -36,8 +39,9 @@ setuptools.setup(
     ],
     python_requires='>=3.6',
     install_requires=[
-        "msgpack>=1.0.0,<1.1.0",
         "dill>=0.3.2,<0.4",
-        "requests>=2.24,<3.0"
+        "msgpack>=1.0.0,<1.1.0",
+        "requests>=2.24,<3.0",
+        "tabulate>=0.8.7,<0.9.0",
     ],
 )

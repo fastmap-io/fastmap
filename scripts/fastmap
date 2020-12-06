@@ -1,0 +1,129 @@
+#!/usr/bin/python
+
+import argparse
+import importlib
+import json
+import os
+import re
+
+import dill
+import tabulate
+import fastmap
+
+DESCRIPTION = """
+Fastmap CLI for offloading scripts.
+\n\n
+Examples:
+$ fastmap offload scripts/script.py::function_name
+$ fastmap status
+$ fastmap result <task_id> --output-format=json --output-file=save.json
+
+"""
+
+TARGET_RE = re.compile(r"^(?P<path>[^\0]+?\.py)::"
+                       r"(?P<func>[A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def offload(config, target):
+    match = TARGET_RE.match(target)
+    if not match:
+        raise AssertionError("Target %r must be of format "
+                             "path/to/script.py::function_name" % target)
+    path = match['path']
+    function_name = match['func']
+    if not os.path.exists(path):
+        raise AssertionError("Path %r does not exist." % path)
+    mod_path = path.replace('/', '.')
+    try:
+        mod = importlib.import_module(mod_path)
+    except ImportError:
+        raise AssertionError("Could not import module %r" % mod_path) from None
+
+    try:
+        func = getattr(mod, function_name)
+    except AttributeError:
+        raise AssertionError("Could not import function %r from module %r" %
+                             (func, mod_path)) from None
+    fp = config.offload(func)
+
+
+
+def poll(config, task_id):
+    resp = config.poll(task_id)
+    print(tabulate(resp, headers="keys"))
+
+
+def result(config, task_id, output_format, output_file):
+    _result = config.result(task_id)
+    if output_format == "json":
+        _result = json.dumps(dill.loads(_result))
+    if output_file:
+        with open(output_file, 'w') as f:
+            f.write(_result)
+    else:
+        print(_result)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description=DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    subparsers = parser.add_subparsers(
+        dest='operation', required=True,
+        help='sub-command help')
+
+    offload_p = subparsers.add_parser(
+        'offload',
+        help="Offload a new task.")
+    offload_p.add_argument(
+        "target",
+        help="The python script path and function separated by a double colon."
+             "E.g. path/script.py::function")
+    offload_p.add_argument(
+        "--verbosity",
+        choices=("QUIET", "NORMAL", "LOUD"), default="NORMAL")
+
+    status_p = subparsers.add_parser(
+        'poll', help="Get the status of running task(s)")
+    status_p.add_argument(
+        "task_id", nargs='?',
+        help="Task ID. If omitted, return all running tasks")
+    status_p.add_argument("--verbosity", choices=("QUIET", "NORMAL", "LOUD"),
+                          default="NORMAL")
+
+    result_p = subparsers.add_parser(
+        'result',
+        help="Get the result of a completed task")
+    result_p.add_argument(
+        "task_id",
+        help="Task ID of completed task.")
+    result_p.add_argument(
+        "--output-format", choices=["dill", "json"],
+        default="dill", help="Convert output to format. Default is dill.")
+    result_p.add_argument(
+        "--output-file",
+        help="File to send the result to. If omitted, send result to stdout "
+             "while redirecting regular stdout to stderr.")
+    result_p.add_argument("--verbosity", choices=("QUIET", "NORMAL", "LOUD"),
+                          default="NORMAL")
+    args = parser.parse_args()
+
+    secret = os.environ.get('FASTMAP_SECRET')
+    if not secret:
+        raise AssertionError("The 'FASTMAP_SECRET' env variable must be set. "
+                             "See the docs.")
+
+    config = fastmap.init(
+        secret=secret,
+        verbosity=args.verbosity,
+        exec_policy=fastmap.ExecPolicy.CLOUD,
+        confirm_charges=True)
+
+    if args.operation == 'offload':
+        offload(config, args.target)
+
+    if args.operation == 'poll':
+        poll(config, args.task_id)
+
+    if args.operation == 'result':
+        result(config, args.task_id, args.output_format, args.output_file)
