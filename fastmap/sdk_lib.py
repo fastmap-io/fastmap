@@ -83,8 +83,8 @@ INIT_PARAMS = """
         By default, fastmap will start num_cores * 2 - 2.
     :param int max_cloud_workers: Maximum number of cloud workers to start.
         By default, fastmap will start 5.
-    :param dict dependencies: Manually override dependency discovery.
-        See the docs to understand better.
+    :param dict requirements: A dict of requirement->version like
+        {'requests': '2.4.0'}. If omitted, requirement discovery is automatic.
     :param bool confirm_charges: Manually confirm cloud charges.
 
     For more documentation, go to https://fastmap.io/docs
@@ -766,7 +766,7 @@ def get_modules(log: FastmapLogger) -> (Dict[str, str], List[ModuleType]):
     other modules
     """
     std_lib_dir = distutils.sysconfig.get_python_lib(standard_lib=True)
-    local_module_sources = {}
+    local_modules = {}
     installed_modules = []
     for mod_name, mod in sys.modules.items():
         if (mod_name in sys.builtin_module_names or  # not builtin # noqa
@@ -786,9 +786,9 @@ def get_modules(log: FastmapLogger) -> (Dict[str, str], List[ModuleType]):
         with open(mod.__file__) as f:
             source = f.read()
             if source:
-                local_module_sources[mod.__name__] = source
+                local_modules[mod.__name__] = source
 
-    return local_module_sources, installed_modules
+    return local_modules, installed_modules
 
 
 def get_requirements(installed_modules: List[ModuleType],
@@ -831,20 +831,20 @@ def get_requirements(installed_modules: List[ModuleType],
     for mod_name in imported_module_names:
         pkg_name = packages_by_module[mod_name]
         pkg_version = importlib.metadata.version(pkg_name)
-        requirements[pkg_name] = pkg_name + "==" + pkg_version
+        requirements[pkg_name] = pkg_version
 
     return requirements
 
 
-def get_dependencies(log: FastmapLogger) -> Dict[str, str]:
+def get_dependencies(requirements: dict, log: FastmapLogger) -> (dict, dict):
     """
     Get dependency dictionary.
     Keys are module names.
     Values are either pip version strings or source code.
     """
-    local_module_sources, installed_modules = get_modules(log)
-    requirements = get_requirements(installed_modules, log)
-    return {**local_module_sources, **requirements}
+    local_modules, installed_modules = get_modules(log)
+    requirements = requirements or get_requirements(installed_modules, log)
+    return local_modules, requirements
 
 
 def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
@@ -1284,14 +1284,14 @@ class FastmapConfig():
         "max_local_workers",
         "max_cloud_workers",
         "cloud_url_base",
-        "dependencies",
+        "requirements",
     ]
 
     def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
                  exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
                  max_local_workers=None, cloud_url_base=CLOUD_URL_BASE,
                  max_cloud_workers=DEFAULT_MAX_CLOUD_WORKERS,
-                 dependencies=None):
+                 requirements=None):
         if exec_policy not in ExecPolicy:
             raise FastmapException(f"Unknown exec_policy '{exec_policy}'.")
         self.exec_policy = exec_policy
@@ -1300,7 +1300,7 @@ class FastmapConfig():
         self.cloud_url_base = cloud_url_base
         self.confirm_charges = confirm_charges
         self.max_cloud_workers = max_cloud_workers
-        self.dependencies = dependencies
+        self.requirements = requirements
 
         if multiprocessing.current_process().name != "MainProcess":
             # Fixes issue with multiple loud inits during local multiprocessing
@@ -1318,7 +1318,7 @@ class FastmapConfig():
                 self.log.warning("No secret provided. "
                                  "Setting exec_policy to LOCAL.")
 
-        if dependencies is not None and not isinstance(dependencies, dict):
+        if requirements is not None and not isinstance(requirements, dict):
             raise FastmapException("Invalid dependencies format.")
 
         if max_local_workers:
@@ -1468,14 +1468,13 @@ class _CloudSupervisor(multiprocessing.Process):
     def __init__(self, pickled_func: bytes, itdm: InterThreadDataManager,
                  config: FastmapConfig, label: str):
         multiprocessing.Process.__init__(self)
-        if isinstance(config.dependencies, dict):
-            dependencies = config.dependencies
-        else:
-            dependencies = get_dependencies(config.log)
 
+        local_modules, requirements = get_dependencies(config.requirements,
+                                                       config.log)
         encoded_func = msgpack.dumps({
             'func': pickled_func,
-            'dependencies': dependencies})
+            'local_modules': local_modules,
+            'requirements': requirements})
         self.func_payload = gzip.compress(encoded_func, compresslevel=1)
         self.func_hash = get_func_hash(self.func_payload)
         self.itdm = itdm
