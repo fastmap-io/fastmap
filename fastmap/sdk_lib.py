@@ -3,6 +3,7 @@ Primary file for the fastmap SDK. Almost all client-side code is in this file.
 Do not instantiate anything here directly. Use the interface __init__.py.
 """
 
+import collections
 import distutils.sysconfig
 import glob
 import gzip
@@ -159,7 +160,7 @@ def fmt_bytes(num_bytes: int) -> str:
         return "%.1fMB" % (num_bytes / MB)
     if num_bytes >= KB:
         return "%.1fKB" % (num_bytes / KB)
-    return "%.1fB" % num_bytes
+    return "%dB" % num_bytes
 
 
 def fmt_time(num_secs: int) -> str:
@@ -581,6 +582,9 @@ def post_request(url: str, data: bytes, secret: str,
     This does warning/error management, extracts content, and checks signatures
     for every API post
     """
+    if isinstance(data, dict):
+        data = msgpack.dumps(data)
+
     headers = basic_headers(secret, data)
     try:
         resp = requests.post(url, data=data, headers=headers)
@@ -652,20 +656,15 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
                   fmt_bytes(len(compressed_batch) / len(batch)))
         resp = post_request(url, payload, secret, log)
         if resp.status_code == 200:
-            if resp.status == "CREATING_WORKER":
-                log.debug("No cloud workers available. Retrying in 5 seconds...")
-                time.sleep(5)
-                continue
-            elif resp.status == "INIT_WORKER":
-                log.debug("Cloud worker is initializing [%s] (%.1f%%)."
+            if resp.status == "INIT_WORKER":
+                log.debug("Cloud worker is initializing. Last msg [%s]."
                           " Retrying in 5 seconds..." %
-                          (resp.obj.get('init_step', ''),
-                           float(resp.obj.get('init_progress', 0.0)) * 100))
+                          (resp.obj.get('init_step', '')))
                 time.sleep(5)
                 continue
             elif resp.status == "INIT_WORKER_ERROR":
-                raise CloudError("Error initializing worker %r" %
-                                 resp.obj.get('init_error'))
+                raise CloudError("Error initializing worker %r %r" % (
+                                 resp.obj.get('init_error'), resp.obj.get('init_tb')))
         break
 
     if resp.status == "BATCH_PROCESSED":
@@ -762,12 +761,16 @@ def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
 
 def get_modules(log: FastmapLogger) -> (Dict[str, str], List[ModuleType]):
     """
-    From sys.modules, return the source of local modules and a list of
-    other modules
+    Get in scope modules.
+    Returns two things:
+    1.  a dictionary of all mod_name -> source|None
+    2.  a list of ModuleType for modules found in site packages
+    For the former, a source is included if it is a local module. If it is
+    an installed module, the source is None
     """
     std_lib_dir = distutils.sysconfig.get_python_lib(standard_lib=True)
-    local_modules = {}
-    installed_modules = []
+    local_sources = {}
+    installed_mods = []
     for mod_name, mod in sys.modules.items():
         if (mod_name in sys.builtin_module_names or  # not builtin # noqa
             mod_name.startswith("_") or  # not hidden # noqa
@@ -777,33 +780,37 @@ def get_modules(log: FastmapLogger) -> (Dict[str, str], List[ModuleType]):
              mod.__package__ in ("fastmap", "fastmap.fastmap"))):  # not fastmap
                 continue  # noqa
         if SITE_PACKAGES_RE.match(mod.__file__):
-            installed_modules.append(mod)
+            installed_mods.append(mod)
             continue
         if not mod.__file__.endswith('.py'):
             log.warning("The module %r is a non-Python locally-built module "
-                        "which unfortunately cannot be uploaded.", mod)
+                        "which cannot be uploaded.", mod)
             continue
         with open(mod.__file__) as f:
             source = f.read()
             if source:
-                local_modules[mod.__name__] = source
+                local_sources[mod.__name__] = source
 
-    return local_modules, installed_modules
+    return local_sources, installed_mods
 
 
-def get_requirements(installed_modules: List[ModuleType],
+def get_requirements(installed_mods: List[ModuleType],
                      log: FastmapLogger) -> List[str]:
     """
     Get pip installed requirements which are loaded into the
     """
     imported_module_names = set()
     site_packages_dirs = set()
-    for mod in installed_modules:
+    for mod in installed_mods:
         try:
-            imported_module_names.add(mod.__package__.split('.', 1)[0])
-        except Exception:
-            log.warning("Module %r had no package. This may cause problems "
-                        "when executing in the cloud.", mod)
+            mod_name = mod.__package__
+        except AttributeError:
+            mod_name = None
+        if not mod_name:
+            log.warning("Module %r had no __package__. If this causes problems, "
+                        "try using the 'requirements' parameter.", mod.__name__)
+            mod_name = mod.__name__
+        imported_module_names.add(mod_name)
         site_packages_dirs.add(SITE_PACKAGES_RE.match(mod.__file__).group(0))
 
     top_level_files = set()
@@ -811,7 +818,7 @@ def get_requirements(installed_modules: List[ModuleType],
         top_level_path = site_packages_dir + "*.dist-info/top_level.txt"
         top_level_files.update(glob.glob(top_level_path))
 
-    packages_by_module = {}
+    packages_by_module = collections.defaultdict(set)
     for fn in top_level_files:
         with open(fn) as f:
             modules = f.read().split('\n')
@@ -825,13 +832,34 @@ def get_requirements(installed_modules: List[ModuleType],
         if not pkg_name:
             raise FastmapException("No package name for %r" % fn)
         for mod_name in modules:
-            packages_by_module[mod_name] = pkg_name
+            packages_by_module[mod_name].add(pkg_name)
 
     requirements = {}
+    missed_modules = set()
     for mod_name in imported_module_names:
-        pkg_name = packages_by_module[mod_name]
-        pkg_version = importlib.metadata.version(pkg_name)
-        requirements[pkg_name] = pkg_version
+        pkg_names = packages_by_module[mod_name]
+        if not pkg_names:
+            # print('\a'); import ipdb; ipdb.set_trace()
+            # log.warning("Could not find version for module %r. Skipping...",
+            #             mod_name)
+            missed_modules.add(mod_name)
+            # requirements[mod_name] = None
+            continue
+        for pkg_name in pkg_names:
+            pkg_version = importlib.metadata.version(pkg_name)
+            requirements[pkg_name] = pkg_version
+
+    # one last run-through to make sure we didn't forget anything
+    # this fixed the issue with google.cloud.vision import
+    for missed_mod in missed_modules:
+        missed_mod = missed_mod.replace('.', '-')
+        try:
+            pkg_version = importlib.metadata.version(missed_mod)
+        except:
+            continue
+        requirements[missed_mod] = pkg_version
+
+    # print('\a'); import ipdb; ipdb.set_trace()
 
     return requirements
 
@@ -842,9 +870,18 @@ def get_dependencies(requirements: dict, log: FastmapLogger) -> (dict, dict):
     Keys are module names.
     Values are either pip version strings or source code.
     """
-    local_modules, installed_modules = get_modules(log)
-    requirements = requirements or get_requirements(installed_modules, log)
-    return local_modules, requirements
+    local_sources, installed_mods = get_modules(log)
+    requirements = requirements or get_requirements(installed_mods, log)
+    installed_mods = [im.__name__ for im in installed_mods]
+
+    req_str = ' '.join(k + "==" + v for k, v in sorted(requirements.items()))
+    mods_str = ', '.join(sorted(local_sources.keys()))
+
+    log.debug("Found %d installed modules" % len(installed_mods))
+    log.debug("Found requirements [%s]" % req_str)
+    log.debug("Found local imports [%s]" % mods_str)
+
+    return local_sources, installed_mods, requirements
 
 
 def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
@@ -1469,11 +1506,12 @@ class _CloudSupervisor(multiprocessing.Process):
                  config: FastmapConfig, label: str):
         multiprocessing.Process.__init__(self)
 
-        local_modules, requirements = get_dependencies(config.requirements,
-                                                       config.log)
+        local_sources, installed_mods, requirements = get_dependencies(
+            config.requirements, config.log)
         encoded_func = msgpack.dumps({
             'func': pickled_func,
-            'local_modules': local_modules,
+            'local_sources': local_sources,
+            'installed_mods': installed_mods,
             'requirements': requirements})
         self.func_payload = gzip.compress(encoded_func, compresslevel=1)
         self.func_hash = get_func_hash(self.func_payload)
@@ -1497,9 +1535,9 @@ class _CloudSupervisor(multiprocessing.Process):
         Because of server-side caching, and the potential for very large
         payloads, check with the function hash before uploading the function.
         """
-        req_dict = {}
 
         # Step 1: Try just uploaded the function hash. If it exists, we are good.
+        req_dict = {}
         req_dict['func_hash'] = self.func_hash
         url = self.cloud_url_base + "/api/v1/init"
         payload = msgpack.dumps(req_dict)
@@ -1508,6 +1546,7 @@ class _CloudSupervisor(multiprocessing.Process):
         if resp.status_code != 200:
             raise CloudError("Cloud initialization failed %r." % resp.obj)
         if resp.status == 'EXISTS':
+            self.log.info("Function already exists on cloud.")
             return
 
         # Step 2: If the server can't find the func, we need to upload it
@@ -1518,6 +1557,12 @@ class _CloudSupervisor(multiprocessing.Process):
             req_dict['payload_part'] = i
             req_dict['payload_len'] = len(func_parts)
             payload = msgpack.dumps(req_dict)
+            payload_bytes = fmt_bytes(len(payload))
+            if len(func_parts) > 1:
+                self.log.info("Uploading code (%s) part %d/%d..." %
+                              (payload_bytes, i + 1, len(func_parts)))
+            else:
+                self.log.info("Uploading code (%s)..." % payload_bytes)
             resp = post_request(url, payload, self.secret, self.log)
 
             if resp.status_code != 200:
@@ -1525,6 +1570,7 @@ class _CloudSupervisor(multiprocessing.Process):
             if resp.status == 'UPLOADED':
                 continue
             raise CloudError("Cloud initialization failed. Function not uploaded.")
+        self.log.info("Done uploading code.")
         return
 
     def run(self):
