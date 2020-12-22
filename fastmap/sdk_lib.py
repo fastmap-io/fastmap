@@ -1383,9 +1383,11 @@ class FastmapConfig():
             self.max_local_workers = os.cpu_count() - 2
 
         if not confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
-            self.log.warning("Your fastmap credit balance will be "
-                             "automatically debited for use. To avoid "
-                             "automatic debits, set confirm_charges=True.")
+            pass
+            # TODO
+            # self.log.warning("Your fastmap credit balance will be "
+            #                  "automatically debited for use. To avoid "
+            #                  "automatic debits, set confirm_charges=True.")
 
         self.log.info("Setup fastmap.")
         self.log.info(" verbosity: %s.", self.verbosity)
