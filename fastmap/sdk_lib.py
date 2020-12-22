@@ -26,7 +26,6 @@ import dill
 import msgpack
 import requests
 
-CLOUD_URL_BASE = 'https://fastmap.io'
 DEFAULT_MAX_CLOUD_WORKERS = 5
 SECRET_LEN = 64
 SECRET_RE = r'^[0-9a-z]{64}$'
@@ -265,6 +264,10 @@ Color = Namespace(
     YELLOW="\033[93m",
     CYAN="\033[36m",
     CANCEL="\033[0m")
+AuthStatus = Namespace("AUTHORIZED")
+InitStatus = Namespace("UPLOADED", "FOUND", "NOT_FOUND")
+MapStatus = Namespace("NOT_FOUND", "BATCH_PROCESSED", "INITALIZING", "INITIALIZATION_ERROR", "PROCESS_ERROR")
+DoneStatus = Namespace("DONE", "NOT_FOUND")
 
 
 def simplified_tb(tb: str) -> str:
@@ -625,8 +628,8 @@ def post_request(url: str, data: bytes, secret: str,
 
 
 def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
-                        url: str, func_hash: str, label: str, run_id: str,
-                        secret: str, log: FastmapLogger) -> None:
+                        map_url: str, func_hash: str, label: str,
+                        run_id: str, secret: str, log: FastmapLogger) -> None:
     """
     For /api/v1/map, finish preparing the request, send it, and handle the
     response. Processed batches go back into the itdm. If a
@@ -654,22 +657,21 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
         log.debug("Making cloud request batchlen=%d size=%s (%s/el)...",
                   len(batch), fmt_bytes(len(compressed_batch)),
                   fmt_bytes(len(compressed_batch) / len(batch)))
-        resp = post_request(url, payload, secret, log)
+        resp = post_request(map_url, payload, secret, log)
         if resp.status_code == 200:
-            if resp.status == "INIT_WORKER":
+            if resp.status == MapStatus.INITALIZING:
                 log.debug("Cloud worker is initializing. Last msg [%s]."
                           " Retrying in 5 seconds..." %
                           (resp.obj.get('init_step', '')))
                 time.sleep(5)
                 continue
-            elif resp.status == "INIT_WORKER_ERROR":
+            elif resp.status == MapStatus.INITIALIZATION_ERROR:
                 raise CloudError("Error initializing worker %r %r" % (
                                  resp.obj.get('init_error'), resp.obj.get('init_tb')))
         break
 
-    if resp.status == "BATCH_PROCESSED":
-        cloud_cid = resp.headers['X-Controller-Id']
-        worker_cid = resp.headers['X-Worker-Id']
+    if resp.status == MapStatus.BATCH_PROCESSED:
+        service_id = resp.headers['X-Service-Id']
         total_request = time.perf_counter() - start_req_time
         total_application = float(resp.headers['X-Application-Seconds'])
         total_mapping = float(resp.headers['X-Map-Seconds'])
@@ -681,11 +683,11 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
 
         log.debug("Batch %d cloud cnt=%d "
                   "%.2fs/%.2fs/%.2fs map/app/req (%.2e/%.2e/%.2e per el) "
-                  "[%s/%s].",
+                  "[%s].",
                   batch_idx, result_len,
                   total_mapping, total_application, total_request,
                   map_time_per_el, app_time_per_el, req_time_per_el,
-                  cloud_cid, worker_cid)
+                  service_id)
         itdm.push_outbox(batch_idx,
                          resp.obj['results'],
                          None,
@@ -693,9 +695,7 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
                          network_seconds=total_request - total_application)
         return
 
-    if resp.status == "INTERNAL_FASTMAP_ERROR":
-        raise CloudError("Unexpected cloud error. Try again later.")
-    if resp.status == "WORKER_EXECUTION_ERROR":
+    if resp.status_code == MapStatus.PROCESS_ERROR:
         # ERROR
         msg = "Your code could not be processed on the cloud: %r" % \
             resp.obj.get('exception')
@@ -703,6 +703,9 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
         if bad_modules:
             msg += " Modules with errors on import: %r" % bad_modules
         raise CloudError(msg, tb=resp.obj.get('traceback', ''))
+    if resp.status == MapStatus.NOT_FOUND:
+        msg = "Your function was not found on the cloud."
+        raise CloudError(msg)
     if resp.status_code == 401:
         # UNAUTHORIZED
         raise CloudError("Unauthorized. Check your API token.")
@@ -728,7 +731,7 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
                      (resp.status_code, resp.status, resp.obj))
 
 
-def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
+def cloud_thread(thread_id: str, map_url: str, func_hash: str, label: str,
                  run_id: str, itdm: InterThreadDataManager, secret: str,
                  log: FastmapLogger):
     """
@@ -741,7 +744,7 @@ def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
         log.debug("Starting cloud thread %d...", thread_id)
     while batch_tup:
         try:
-            process_cloud_batch(itdm, batch_tup, url, func_hash,
+            process_cloud_batch(itdm, batch_tup, map_url, func_hash,
                                 label, run_id, secret, log)
         except CloudError as e:
             proc_name = multiprocessing.current_process().name
@@ -884,21 +887,21 @@ def get_dependencies(requirements: dict, log: FastmapLogger) -> (dict, dict):
     return local_sources, installed_mods, requirements
 
 
-def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
+def post_done(cloud_url: str, secret: str, log: FastmapLogger,
               func_hash: str, run_id: str) -> None:
     """
     Once fastmap has finished, post done to suggest that the server tidy up.
     If this is not called, the server will do it anyway on a cron schedule.
     """
 
-    url = cloud_url_base + '/api/v1/done'
+    url = cloud_url + '/api/v1/done'
     payload = msgpack.dumps({
         "func_hash": func_hash,
         "run_id": run_id
     })
     resp = post_request(url, payload, secret, log)
 
-    if resp.status_code != 200:
+    if resp.status_code != 200 or resp.status != DoneStatus.DONE:
         log.error("Error on final api call (%d) %r.",
                   resp.status_code, resp.status)
 
@@ -1036,7 +1039,7 @@ class AuthCheck(threading.Thread):
     """
     def __init__(self, config, *args, **kwargs):
         self.secret = config.secret
-        self.url = config.cloud_url_base + '/api/v1/auth'
+        self.url = config.cloud_url + '/api/v1/auth'
         self.log = config.log
         super().__init__(*args, **kwargs)
 
@@ -1049,7 +1052,7 @@ class AuthCheck(threading.Thread):
                            multiprocessing.current_process().name, ex)
             self.success = False
             return
-        if resp.status_code == 200:
+        if resp.status_code == 200 and resp.status == AuthStatus.AUTHORIZED:
             self.log.info("Request to %r was successful.", self.url)
         else:
             self.log.warning("Authentication failed for %r %r. Check your token.",
@@ -1320,13 +1323,13 @@ class FastmapConfig():
         "confirm_charges",
         "max_local_workers",
         "max_cloud_workers",
-        "cloud_url_base",
+        "cloud_url",
         "requirements",
     ]
 
     def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
                  exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
-                 max_local_workers=None, cloud_url_base=CLOUD_URL_BASE,
+                 max_local_workers=None, cloud_url=None,
                  max_cloud_workers=DEFAULT_MAX_CLOUD_WORKERS,
                  requirements=None):
         if exec_policy not in ExecPolicy:
@@ -1334,10 +1337,15 @@ class FastmapConfig():
         self.exec_policy = exec_policy
         self.log = FastmapLogger(verbosity)
         self.verbosity = verbosity
-        self.cloud_url_base = cloud_url_base
+        self.cloud_url = cloud_url
         self.confirm_charges = confirm_charges
         self.max_cloud_workers = max_cloud_workers
         self.requirements = requirements
+
+        if not self.cloud_url.startswith("http"):
+            self.cloud_url = "http://" + self.cloud_url
+        if self.cloud_url.endswith("/"):
+            self.cloud_url = self.cloud_url[:-1]
 
         if multiprocessing.current_process().name != "MainProcess":
             # Fixes issue with multiple loud inits during local multiprocessing
@@ -1519,14 +1527,14 @@ class _CloudSupervisor(multiprocessing.Process):
 
         self.log = config.log
         self.max_cloud_workers = config.max_cloud_workers
-        self.cloud_url_base = config.cloud_url_base
+        self.cloud_url = config.cloud_url
         self.secret = config.secret
         self.process_name = multiprocessing.current_process().name
         self.label = label
         self.run_id = secrets.token_hex(8)
         self.log.info("Started cloud supervisor for remote url (%r). "
                       "Function payload size is %s.",
-                      self.cloud_url_base, fmt_bytes(len(self.func_payload)))
+                      self.cloud_url, fmt_bytes(len(self.func_payload)))
 
     def init_remote(self):
         """
@@ -1539,15 +1547,17 @@ class _CloudSupervisor(multiprocessing.Process):
         # Step 1: Try just uploaded the function hash. If it exists, we are good.
         req_dict = {}
         req_dict['func_hash'] = self.func_hash
-        url = self.cloud_url_base + "/api/v1/init"
+        url = self.cloud_url + "/api/v1/init"
         payload = msgpack.dumps(req_dict)
         resp = post_request(url, payload, self.secret, self.log)
 
         if resp.status_code != 200:
             raise CloudError("Cloud initialization failed %r." % resp.obj)
-        if resp.status == 'EXISTS':
+        if resp.status == InitStatus.FOUND:
             self.log.info("Function already exists on cloud.")
             return
+        if resp.status != InitStatus.NOT_FOUND:
+            raise CloudError("Unexpected init status %r." % resp.obj)
 
         # Step 2: If the server can't find the func, we need to upload it
         # We might need to chunk the upload due to cloud run limits
@@ -1567,7 +1577,7 @@ class _CloudSupervisor(multiprocessing.Process):
 
             if resp.status_code != 200:
                 raise CloudError("Cloud initialization failed %r." % resp.obj)
-            if resp.status == 'UPLOADED':
+            if resp.status == InitStatus.UPLOADED:
                 continue
             raise CloudError("Cloud initialization failed. Function not uploaded.")
         self.log.info("Done uploading code.")
@@ -1590,9 +1600,9 @@ class _CloudSupervisor(multiprocessing.Process):
         if not batch_tup:
             return
 
-        map_endpoint = self.cloud_url_base + '/api/v1/map'
+        map_url = self.cloud_url + '/api/v1/map'
         try:
-            process_cloud_batch(self.itdm, batch_tup, map_endpoint,
+            process_cloud_batch(self.itdm, batch_tup, map_url,
                                 self.func_hash, self.label,
                                 self.run_id, self.secret, self.log)
         except CloudError as e:
@@ -1610,7 +1620,7 @@ class _CloudSupervisor(multiprocessing.Process):
                                 self.itdm.inbox_len())
         self.log.debug("Opening %d cloud connection(s)...", num_cloud_threads)
         for thread_id in range(num_cloud_threads):
-            thread_args = (thread_id, map_endpoint, self.func_hash, self.label,
+            thread_args = (thread_id, map_url, self.func_hash, self.label,
                            self.run_id, self.itdm, self.secret, self.log)
             thread = threading.Thread(target=cloud_thread, args=thread_args)
             thread.start()
@@ -1619,7 +1629,7 @@ class _CloudSupervisor(multiprocessing.Process):
         for thread in threads:
             thread.join()
 
-        post_done_args = (self.cloud_url_base, self.secret, self.log,
+        post_done_args = (self.cloud_url, self.secret, self.log,
                           self.func_hash, self.run_id)
         done_thread = threading.Thread(target=post_done, args=post_done_args)
         done_thread.start()
