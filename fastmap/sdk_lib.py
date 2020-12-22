@@ -810,8 +810,9 @@ def get_requirements(installed_mods: List[ModuleType],
         except AttributeError:
             mod_name = None
         if not mod_name:
-            log.warning("Module %r had no __package__. If this causes problems, "
-                        "try using the 'requirements' parameter.", mod.__name__)
+            # TODO
+            # log.warning("Module %r had no __package__. If this causes problems, "
+            #             "try using the 'requirements' parameter.", mod.__name__)
             mod_name = mod.__name__
         imported_module_names.add(mod_name)
         site_packages_dirs.add(SITE_PACKAGES_RE.match(mod.__file__).group(0))
@@ -1153,7 +1154,17 @@ class Mapper():
             max_batches_in_queue = self.config.max_local_workers + \
                                    self.config.max_cloud_workers  # noqa
 
-        itdm = InterThreadDataManager(self.avg_runtime, max_batches_in_queue)
+        try:
+            itdm = InterThreadDataManager(self.avg_runtime, max_batches_in_queue)
+        except EOFError as ex:
+            self.log.error("Error starting multiprocessing. To fix, you "
+                           "probably just need to run your code in the main "
+                           "context. E.g:\n"
+                           "if __name__ == '__main__':\n"
+                           "    # start running program here")
+            raise FastmapException(
+                "Error starting multiprocessing. See the "
+                f'"{Color.RED}fastmap ERROR{Color.CANCEL}" above.') from ex
 
         try:
             pickled_func = dill.dumps(func, recurse=True)
