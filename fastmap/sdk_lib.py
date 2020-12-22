@@ -878,12 +878,12 @@ def get_dependencies(requirements: dict, log: FastmapLogger) -> (dict, dict):
     requirements = requirements or get_requirements(installed_mods, log)
     installed_mods = [im.__name__ for im in installed_mods]
 
-    req_str = ' '.join(k + "==" + v for k, v in sorted(requirements.items()))
-    mods_str = ', '.join(sorted(local_sources.keys()))
-
-    log.debug("Found %d installed modules" % len(installed_mods))
-    log.debug("Found requirements [%s]" % req_str)
-    log.debug("Found local imports [%s]" % mods_str)
+    # TODO
+    # req_str = ' '.join(k + "==" + v for k, v in sorted(requirements.items()))
+    # mods_str = ', '.join(sorted(local_sources.keys()))
+    # log.debug("Found %d installed modules" % len(installed_mods))
+    # log.debug("Found requirements [%s]" % req_str)
+    # log.debug("Found local imports [%s]" % mods_str)
 
     return local_sources, installed_mods, requirements
 
