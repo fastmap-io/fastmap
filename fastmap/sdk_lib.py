@@ -670,6 +670,12 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
                                  resp.obj.get('init_error'), resp.obj.get('init_tb')))
         break
 
+    mem_used = (resp.headers.get('X-Mem-Used', 0.0)
+                / resp.headers.get('X-Mem-Total', 1.0))
+    if mem_used > 0.9:
+        log.warning("Cloud memory utilization high: %.2f%%. "
+                    "Consider increasing memory." % mem_used * 100)
+
     if resp.status == MapStatus.BATCH_PROCESSED:
         service_id = resp.headers['X-Service-Id']
         total_request = time.perf_counter() - start_req_time
@@ -695,13 +701,15 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
                          network_seconds=total_request - total_application)
         return
 
-    if resp.status_code == MapStatus.PROCESS_ERROR:
+    if resp.status == MapStatus.PROCESS_ERROR:
         # ERROR
-        msg = "Your code could not be processed on the cloud: %r" % \
+        msg = "Your code could not be processed on the cloud: %s. " % \
             resp.obj.get('exception')
         bad_modules = resp.obj.get('bad_modules', [])
         if bad_modules:
-            msg += " Modules with errors on import: %r" % bad_modules
+            msg += "Modules with errors on import: %s." % ' '.join(bad_modules)
+            msg += "You might need to explicitly specify a requirements file " \
+                   "in your deployment."
         raise CloudError(msg, tb=resp.obj.get('traceback', ''))
     if resp.status == MapStatus.NOT_FOUND:
         msg = "Your function was not found on the cloud."
@@ -725,6 +733,11 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
         raise CloudError("Your request was too large (%s). "
                          "Find a way to reduce the size of your data or "
                          "function and try again." % fmt_bytes(len(payload)))
+
+    if resp.status_code == 500 and resp.headers['Content-Type'] == 'text/html':
+        content = re.sub('<[^<]+?>', '', resp.text)
+        raise CloudError("Unexpected cloud error 500. You might have run out "
+                         "of memory. %s" % content)
 
     # catch all (should just be for 500s of which a few are explicitly defined)
     raise CloudError("Unexpected cloud response %d %s %r" %
@@ -752,8 +765,9 @@ def cloud_thread(thread_id: str, map_url: str, func_hash: str, label: str,
             error_loc = "%s: thread:%d" % (proc_name, thread_id)
             itdm.put_error(error_loc, repr(e), batch_tup)
             if hasattr(e, 'tb') and e.tb:
+                tb = e.tb.replace('%0A', '\n')
                 log.error("In cloud thread [%s]:\n%s.",
-                          threading.current_thread().name, e.tb)
+                          threading.current_thread().name, tb)
             else:
                 log.error("In cloud thread [%s]: %r.",
                           threading.current_thread().name, e)
@@ -1621,8 +1635,9 @@ class _CloudSupervisor(multiprocessing.Process):
         except CloudError as e:
             self.itdm.put_error(self.process_name, repr(e), batch_tup)
             if hasattr(e, 'tb') and e.tb:
+                tb = e.tb.replace('%0A', '\n')
                 self.log.error("In cloud supervisor [%s]:\n%s.",
-                               multiprocessing.current_process().name, e.tb)
+                               multiprocessing.current_process().name, tb)
             else:
                 self.log.error("In cloud supervisor [%s]: %r.",
                                multiprocessing.current_process().name, e)
