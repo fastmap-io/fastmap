@@ -1354,7 +1354,7 @@ class FastmapConfig():
 
     def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
                  exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
-                 max_local_workers=None, cloud_url=None,
+                 max_local_workers=None, cloud_url="",
                  max_cloud_workers=DEFAULT_MAX_CLOUD_WORKERS,
                  requirements=None):
         if exec_policy not in ExecPolicy:
@@ -1367,10 +1367,11 @@ class FastmapConfig():
         self.max_cloud_workers = max_cloud_workers
         self.requirements = requirements
 
-        if not self.cloud_url.startswith("http"):
-            self.cloud_url = "http://" + self.cloud_url
-        if self.cloud_url.endswith("/"):
-            self.cloud_url = self.cloud_url[:-1]
+        if self.cloud_url:
+            if not self.cloud_url.startswith("http"):
+                self.cloud_url = "http://" + self.cloud_url
+            if self.cloud_url.endswith("/"):
+                self.cloud_url = self.cloud_url[:-1]
 
         if multiprocessing.current_process().name != "MainProcess":
             # Fixes issue with multiple loud inits during local multiprocessing
