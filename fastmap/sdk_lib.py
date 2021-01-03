@@ -312,9 +312,11 @@ class FastmapLogger():
     """
     def __init__(self, verbosity: str):
         self.verbosity = verbosity
+        self.progress = ""
         self.restore_verbosity()
 
     def restore_verbosity(self):
+        self.set_progress = self._set_progress
         self.debug = self._debug
         self.info = self._info
         self.warning = self._warning
@@ -326,9 +328,11 @@ class FastmapLogger():
         elif self.verbosity == Verbosity.QUIET:
             self.debug = self._do_nothing
             self.info = self._do_nothing
+            self.set_progress = self._do_nothing
         elif self.verbosity == Verbosity.SILENT:
             self.debug = self._do_nothing
             self.info = self._do_nothing
+            self.set_progress = self._do_nothing
             self.warning = self._do_nothing
         else:
             raise FastmapException(f"Unknown verbosity '{self.verbosity}'")
@@ -339,36 +343,44 @@ class FastmapLogger():
         self.warning = self._do_nothing  # noqa
         self.error = self._do_nothing  # noqa
 
+    def _set_progress(self, progress):
+        self.progress = progress
+        sys.stdout.write(progress)
+        sys.stdout.flush()
+
     def _do_nothing(self, *args):
         # This instead of a lambda because of pickling in multiprocessing
         pass
 
-    @staticmethod
-    def _debug(msg, *args):
+    def _debug(self, msg, *args):
         if args:
             msg = msg % args
-        print(Color.CYAN + "fastmap DEBUG:" + Color.CANCEL, msg)
+        print("\033[K" + Color.CYAN + "fastmap DEBUG:" + Color.CANCEL, msg)
+        sys.stdout.write(self.progress)
+        sys.stdout.flush()
 
-    @staticmethod
-    def _info(msg, *args):
+    def _info(self, msg, *args):
         if args:
             msg = msg % args
-        print(Color.YELLOW + "fastmap INFO:" + Color.CANCEL, msg)
+        print("\033[K" + Color.YELLOW + "fastmap INFO:" + Color.CANCEL, msg)
+        sys.stdout.write(self.progress)
+        sys.stdout.flush()
 
-    @staticmethod
-    def _warning(msg, *args):
+    def _warning(self, msg, *args):
         if args:
             msg = msg % args
-        print(Color.RED + "fastmap WARNING:" + Color.CANCEL, msg)
+        print("\033[K" + Color.RED + "fastmap WARNING:" + Color.CANCEL, msg)
+        sys.stdout.write(self.progress)
+        sys.stdout.flush()
 
-    @staticmethod
-    def _error(msg, *args):
+    def _error(self, msg, *args):
         if args:
             msg = msg % args
-        print(Color.RED + "fastmap ERROR:" + Color.CANCEL, msg, flush=True)
+        print("\033[K" + Color.RED + "fastmap ERROR:" + Color.CANCEL, msg, flush=True)
+        sys.stdout.write(self.progress)
+        sys.stdout.flush()
 
-    @staticmethod
-    def input(msg):
+    def input(self, msg):
         # This exists mostly for test mocking
         return input(Color.CYAN + "\n fastmap: " + msg + Color.CANCEL)
 
@@ -1020,7 +1032,7 @@ class FillInboxWithSeq(_FillInbox):
         self.itdm.mark_inbox_capped()
 
 
-def seq_progress(seq: Sequence, seq_len: int,
+def seq_progress(seq: Sequence, log: FastmapLogger, seq_len: int,
                  start_time: float) -> Generator:
     """
     Progress printer and counter for sequences
@@ -1033,14 +1045,12 @@ def seq_progress(seq: Sequence, seq_len: int,
         elapsed_time = time.perf_counter() - start_time
         num_left = seq_len - proc_cnt
         time_remaining = elapsed_time * num_left / proc_cnt
-        graph_bar = '█' * int(percent / 2)
-        sys.stdout.write("%sfastmap: %s %.1f%% (%s remaining)\r%s" %
-                         (Color.GREEN, graph_bar, percent,
-                          fmt_time(time_remaining), Color.CANCEL))
-        sys.stdout.flush()
+        progress = "%sfastmap: %.1f%% (%s remaining)%s\r" % (
+            Color.GREEN, percent, fmt_time(time_remaining), Color.CANCEL)
+        log.set_progress(progress)
 
 
-def gen_progress(gen: Generator, *args) -> Generator:
+def gen_progress(gen: Generator, log: FastmapLogger, *args) -> Generator:
     """
     Progress printer for generators where the length of the generator is
     not known in advance.
@@ -1050,8 +1060,9 @@ def gen_progress(gen: Generator, *args) -> Generator:
     for batch in gen:
         proc_cnt += len(batch)
         yield batch, proc_cnt
-        sys.stdout.write("%sfastmap: Processed %d\r%s" % (Color.GREEN, proc_cnt, Color.CANCEL))
-        sys.stdout.flush()
+        progress = "%sfastmap: Processed %d%s\r" % (
+            Color.GREEN, proc_cnt, Color.CANCEL)
+        log.set_progress(progress)
 
 
 class AuthCheck(threading.Thread):
@@ -1470,11 +1481,13 @@ class FastmapConfig():
             progress_func = seq_progress if is_seq else gen_progress
 
             if return_type == ReturnType.BATCHES:
-                for batch, proc_cnt in progress_func(fm, seq_len, start_time):
+                for batch, proc_cnt in progress_func(fm, self.log, seq_len,
+                                                     start_time):
                     yield batch
             else:
                 # else return_type is ELEMENTS
-                for batch, proc_cnt in progress_func(fm, seq_len, start_time):
+                for batch, proc_cnt in progress_func(fm, self.log, seq_len,
+                                                     start_time):
                     for el in batch:
                         yield el
 
