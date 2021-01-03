@@ -474,7 +474,7 @@ def test_confirm_charges_basic(capsys, monkeypatch):
     # assert config.exec_policy == "CLOUD"
 
     # If we set confirm charges, assert no warnings are thrown
-    config = init(exec_policy="CLOUD", secret=TEST_SECRET,
+    config = init(exec_policy="CLOUD", secret=TEST_SECRET, cloud_url="https://a.a",
                   confirm_charges=True, max_local_workers=2)
     monkeypatch.setattr(sdk_lib.Mapper, "INITIAL_RUN_DUR", 0)
     monkeypatch.setattr(sdk_lib.Mapper, "PROC_OVERHEAD", 0)
@@ -508,7 +508,8 @@ def test_confirm_charges_basic(capsys, monkeypatch):
 
     # Test enter yes
     monkeypatch.setattr(sdk_lib.FastmapLogger, "input", fake_input_yes)
-    config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, confirm_charges=True)
+    config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, confirm_charges=True,
+                  cloud_url="https://a.a",)
     # monkeypatch.setattr('sys.stdin', io.StringIO('y\n'))
     data = list(config.fastmap(lambda x: x**.5, iter(range(100))))
     assert data
@@ -523,7 +524,8 @@ def test_confirm_charges_basic(capsys, monkeypatch):
 
     # Test unrecognized input
     monkeypatch.setattr(sdk_lib.FastmapLogger, "input", fake_input_try_again)
-    config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, confirm_charges=True)
+    config = init(exec_policy="ADAPTIVE", secret=TEST_SECRET, cloud_url='https://a.a',
+                  confirm_charges=True)
     list(config.fastmap(lambda x: x**.5, iter(range(100))))
     stdio = capsys.readouterr()
     assert "Unrecognized input" in stdio.out

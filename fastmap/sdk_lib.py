@@ -10,6 +10,7 @@ import gzip
 import hashlib
 import hmac
 import importlib.metadata
+import json
 import multiprocessing
 import os
 import re
@@ -26,7 +27,6 @@ import dill
 import msgpack
 import requests
 
-DEFAULT_MAX_CLOUD_WORKERS = 5
 SECRET_LEN = 64
 SECRET_RE = r'^[0-9a-z]{64}$'
 SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
@@ -71,6 +71,9 @@ FASTMAP_DOCSTRING = """
     """
 
 INIT_PARAMS = """
+    :param str|file|dict config: The json file path / dict of the
+        configuration. Every subsequent argument will alter this configuration.
+        This is optional and if empty, only subsequent parameters will be used.
     :param str secret: The API token generated on fastmap.io. Treat this like a
         password. Do not commit it to version control! Failure to do so could
         result in man-in-the-middle attacks or your credits being used by others
@@ -100,7 +103,7 @@ GLOBAL_INIT_DOCSTRING = """
 
         import fastmap
 
-        fastmap.global_init(secret=FASTMAP_TOKEN)
+        fastmap.global_init(verbosity="LOUD")
         results = fastmap.fastmap(func, iterable)
 
     """ + INIT_PARAMS
@@ -116,11 +119,10 @@ INIT_DOCSTRING = """
 
         import fastmap
 
-        fastmap_config = fastmap.init(secret=FASTMAP_TOKEN)
+        fastmap_config = fastmap.init(verbosity="LOUD")
         results = fastmap_config.fastmap(func, iterable)
 
     """ + INIT_PARAMS
-
 
 dill.settings['recurse'] = True
 
@@ -138,6 +140,48 @@ try:
     multiprocessing.set_start_method("spawn")
 except RuntimeError:
     pass
+
+
+class Namespace(dict):
+    """
+    Abstract constants class
+    Constants can be accessed via .attribute or [key] and can be iterated over.
+    """
+    def __init__(self, *args, **kwargs):
+        d = {k: k for k in args}
+        d.update(dict(kwargs.items()))
+        super().__init__(d)
+
+    def __getattr__(self, item):
+        if item in self:
+            return self[item]
+        raise AttributeError
+
+
+Verbosity = Namespace("SILENT", "QUIET", "NORMAL", "LOUD")
+ExecPolicy = Namespace("ADAPTIVE", "LOCAL", "CLOUD")
+ReturnType = Namespace("ELEMENTS", "BATCHES")
+Color = Namespace(
+    GREEN="\033[92m",
+    RED="\033[91m",
+    YELLOW="\033[93m",
+    CYAN="\033[36m",
+    CANCEL="\033[0m")
+AuthStatus = Namespace("AUTHORIZED")
+InitStatus = Namespace("UPLOADED", "FOUND", "NOT_FOUND")
+MapStatus = Namespace("NOT_FOUND", "BATCH_PROCESSED", "INITALIZING", "INITIALIZATION_ERROR", "PROCESS_ERROR")
+DoneStatus = Namespace("DONE", "NOT_FOUND")
+
+DEFAULT_CONFIG = {
+    'secret': None,
+    'cloud_url': None,
+    'verbosity': Verbosity.NORMAL,
+    'exec_policy': ExecPolicy.ADAPTIVE,
+    'confirm_charges': False,
+    'max_local_workers': None,
+    'max_cloud_workers': 10,
+    'requirements': None,
+}
 
 
 def set_docstring(docstr: str, docstr_prefix='') -> FunctionType:
@@ -237,37 +281,6 @@ class CloudError(Exception):
         except KeyError:
             self.tb = None
         super().__init__(*args, **kwargs)
-
-
-class Namespace(dict):
-    """
-    Abstract constants class
-    Constants can be accessed via .attribute or [key] and can be iterated over.
-    """
-    def __init__(self, *args, **kwargs):
-        d = {k: k for k in args}
-        d.update(dict(kwargs.items()))
-        super().__init__(d)
-
-    def __getattr__(self, item):
-        if item in self:
-            return self[item]
-        raise AttributeError
-
-
-Verbosity = Namespace("SILENT", "QUIET", "NORMAL", "LOUD")
-ExecPolicy = Namespace("ADAPTIVE", "LOCAL", "CLOUD")
-ReturnType = Namespace("ELEMENTS", "BATCHES")
-Color = Namespace(
-    GREEN="\033[92m",
-    RED="\033[91m",
-    YELLOW="\033[93m",
-    CYAN="\033[36m",
-    CANCEL="\033[0m")
-AuthStatus = Namespace("AUTHORIZED")
-InitStatus = Namespace("UPLOADED", "FOUND", "NOT_FOUND")
-MapStatus = Namespace("NOT_FOUND", "BATCH_PROCESSED", "INITALIZING", "INITIALIZATION_ERROR", "PROCESS_ERROR")
-DoneStatus = Namespace("DONE", "NOT_FOUND")
 
 
 def simplified_tb(tb: str) -> str:
@@ -1370,36 +1383,51 @@ class FastmapConfig():
         "requirements",
     ]
 
-    def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
-                 exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
-                 max_local_workers=None, cloud_url="",
-                 max_cloud_workers=DEFAULT_MAX_CLOUD_WORKERS,
-                 requirements=None):
-        if exec_policy not in ExecPolicy:
-            raise FastmapException(f"Unknown exec_policy '{exec_policy}'.")
-        self.exec_policy = exec_policy
-        self.log = FastmapLogger(verbosity)
-        self.verbosity = verbosity
-        self.cloud_url = cloud_url
-        self.confirm_charges = confirm_charges
-        self.max_cloud_workers = max_cloud_workers
-        self.requirements = requirements
+    def __init__(self, config=None, **kwargs):
+        if not config:
+            c = dict(DEFAULT_CONFIG)
+        elif isinstance(config, dict):
+            c = dict(config)
+        elif isinstance(config, str):
+            with open(config) as f:
+                c = json.loads(f.read())
+        else:
+            raise FastmapException(f"Unknown config type {type(config)}")
+
+        for k, v in kwargs.items():
+            if k not in DEFAULT_CONFIG.keys():
+                raise FastmapException(f"Unknown parameter: {k}")
+            c[k] = v
+
+        if c['exec_policy'] not in ExecPolicy:
+            raise FastmapException(f"Unknown exec_policy '{c['exec_policy']}'.")
+        self.exec_policy = c['exec_policy']
+        self.log = FastmapLogger(c['verbosity'])
+        self.verbosity = c['verbosity']
+        self.cloud_url = c['cloud_url']
+        self.confirm_charges = c['confirm_charges']
+        self.max_cloud_workers = c['max_cloud_workers']
+        self.requirements = c['requirements']
 
         if self.cloud_url:
             if not self.cloud_url.startswith("http"):
                 self.cloud_url = "http://" + self.cloud_url
             if self.cloud_url.endswith("/"):
                 self.cloud_url = self.cloud_url[:-1]
+        elif self.exec_policy != ExecPolicy.LOCAL:
+            self.exec_policy = ExecPolicy.LOCAL
+            self.log.warning("No cloud_url provided. "
+                             "Setting exec_policy to LOCAL.")
 
         if multiprocessing.current_process().name != "MainProcess":
             # Fixes issue with multiple loud inits during local multiprocessing
             # in Mac / Windows
             self.log.hush()
 
-        if secret:
-            if not isinstance(secret, str) or not re.match(SECRET_RE, secret):
+        if c['secret']:
+            if not isinstance(c['secret'], str) or not re.match(SECRET_RE, c['secret']):
                 raise FastmapException("Invalid secret token.")
-            self.secret = secret
+            self.secret = c['secret']
         else:
             self.secret = None
             if self.exec_policy != ExecPolicy.LOCAL:
@@ -1407,32 +1435,32 @@ class FastmapConfig():
                 self.log.warning("No secret provided. "
                                  "Setting exec_policy to LOCAL.")
 
-        if requirements is not None and not isinstance(requirements, dict):
+        if self.requirements is not None and not isinstance(self.requirements, dict):
             raise FastmapException("Invalid dependencies format.")
 
-        if max_local_workers:
-            self.max_local_workers = max_local_workers
+        if c['max_local_workers']:
+            self.max_local_workers = c['max_local_workers']
         else:
             self.max_local_workers = os.cpu_count() - 2
 
-        if max_cloud_workers > 100:
+        if self.max_cloud_workers > 100:
             self.log.warning("More than 100 cloud workers will likely cause "
                              "the fastmap server to crash. You have %d",
-                             max_cloud_workers)
+                             self.max_cloud_workers)
 
-        if not confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
+        if not self.confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
             pass
             # TODO
-            # self.log.warning("Your fastmap credit balance will be "
-            #                  "automatically debited for use. To avoid "
-            #                  "automatic debits, set confirm_charges=True.")
+            # self.log.warning("You are set to automatically use cloud "
+            #                  "resources without confirmation. To get "
+            #                  "estimates before usage, set confirm_charges=True.")
 
         self.log.info("Setup fastmap.")
         self.log.info(" verbosity: %s.", self.verbosity)
         self.log.info(" exec_policy: %s.", self.exec_policy)
-        if exec_policy != ExecPolicy.CLOUD:
+        if self.exec_policy != ExecPolicy.CLOUD:
             self.log.info(" max_local_workers: %d.", self.max_local_workers)
-        if exec_policy != ExecPolicy.LOCAL:
+        if self.exec_policy != ExecPolicy.LOCAL:
             self.log.info(" max_cloud_workers: %d.", self.max_cloud_workers)
         self.log.restore_verbosity()  # undo hush
 
