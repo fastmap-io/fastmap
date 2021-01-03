@@ -325,11 +325,9 @@ class FastmapLogger():
     """
     def __init__(self, verbosity: str):
         self.verbosity = verbosity
-        self.progress = ""
         self.restore_verbosity()
 
     def restore_verbosity(self):
-        self.set_progress = self._set_progress
         self.debug = self._debug
         self.info = self._info
         self.warning = self._warning
@@ -341,11 +339,9 @@ class FastmapLogger():
         elif self.verbosity == Verbosity.QUIET:
             self.debug = self._do_nothing
             self.info = self._do_nothing
-            self.set_progress = self._do_nothing
         elif self.verbosity == Verbosity.SILENT:
             self.debug = self._do_nothing
             self.info = self._do_nothing
-            self.set_progress = self._do_nothing
             self.warning = self._do_nothing
         else:
             raise FastmapException(f"Unknown verbosity '{self.verbosity}'")
@@ -356,11 +352,6 @@ class FastmapLogger():
         self.warning = self._do_nothing  # noqa
         self.error = self._do_nothing  # noqa
 
-    def _set_progress(self, progress):
-        self.progress = progress
-        sys.stdout.write(progress)
-        sys.stdout.flush()
-
     def _do_nothing(self, *args):
         # This instead of a lambda because of pickling in multiprocessing
         pass
@@ -369,29 +360,21 @@ class FastmapLogger():
         if args:
             msg = msg % args
         print("\033[K" + Color.CYAN + "fastmap DEBUG:" + Color.CANCEL, msg)
-        sys.stdout.write(self.progress)
-        sys.stdout.flush()
 
     def _info(self, msg, *args):
         if args:
             msg = msg % args
         print("\033[K" + Color.YELLOW + "fastmap INFO:" + Color.CANCEL, msg)
-        sys.stdout.write(self.progress)
-        sys.stdout.flush()
 
     def _warning(self, msg, *args):
         if args:
             msg = msg % args
         print("\033[K" + Color.RED + "fastmap WARNING:" + Color.CANCEL, msg)
-        sys.stdout.write(self.progress)
-        sys.stdout.flush()
 
     def _error(self, msg, *args):
         if args:
             msg = msg % args
         print("\033[K" + Color.RED + "fastmap ERROR:" + Color.CANCEL, msg, flush=True)
-        sys.stdout.write(self.progress)
-        sys.stdout.flush()
 
     def input(self, msg):
         # This exists mostly for test mocking
@@ -1051,6 +1034,7 @@ def seq_progress(seq: Sequence, log: FastmapLogger, seq_len: int,
     Progress printer and counter for sequences
     """
     proc_cnt = 0
+    percenters = list(range(10, 100, 10))
     for batch in seq:
         proc_cnt += len(batch)
         yield batch, proc_cnt
@@ -1060,7 +1044,13 @@ def seq_progress(seq: Sequence, log: FastmapLogger, seq_len: int,
         time_remaining = elapsed_time * num_left / proc_cnt
         progress = "%sfastmap: %.1f%% (%s remaining)%s\r" % (
             Color.GREEN, percent, fmt_time(time_remaining), Color.CANCEL)
-        log.set_progress(progress)
+        sys.stdout.write(progress)
+        sys.stdout.flush()
+        if not percenters or percent < percenters[0]:
+            continue
+        while percenters and percent >= percenters[0]:
+            percenters = percenters[1:]
+        print(progress[:-1])
 
 
 def gen_progress(gen: Generator, log: FastmapLogger, *args) -> Generator:
@@ -1075,7 +1065,8 @@ def gen_progress(gen: Generator, log: FastmapLogger, *args) -> Generator:
         yield batch, proc_cnt
         progress = "%sfastmap: Processed %d%s\r" % (
             Color.GREEN, proc_cnt, Color.CANCEL)
-        log.set_progress(progress)
+        sys.stdout.write(progress)
+        sys.stdout.flush()
 
 
 class AuthCheck(threading.Thread):
