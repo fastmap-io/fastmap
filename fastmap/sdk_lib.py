@@ -486,12 +486,18 @@ class InterThreadDataManager():
                         return self._inbox.pop(0)
                     except IndexError:
                         return None
+                    except OSError:
+                        print("Too many threads. Shutting one down...")
+                        sys.exit(0)
 
             with self._lock:
                 try:
                     return self._inbox.pop(0)
                 except IndexError:
                     pass
+                except OSError:
+                    print("Too many threads. Shutting one down...")
+                    sys.exit(0)
             time.sleep(.01)
 
     def push_outbox(self, batch_idx: int, processed_batch: list, runtime: float,
@@ -670,8 +676,8 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
                                  resp.obj.get('init_error'), resp.obj.get('init_tb')))
         break
 
-    mem_used = (resp.headers.get('X-Mem-Used', 0.0)
-                / resp.headers.get('X-Mem-Total', 1.0))
+    mem_used = (float(resp.headers.get('X-Mem-Used', 0.0))
+                / float(resp.headers.get('X-Mem-Total', 1.0)))
     if mem_used > 0.9:
         log.warning("Cloud memory utilization high: %.2f%%. "
                     "Consider increasing memory." % mem_used * 100)
@@ -771,6 +777,7 @@ def cloud_thread(thread_id: str, map_url: str, func_hash: str, label: str,
             else:
                 log.error("In cloud thread [%s]: %r.",
                           threading.current_thread().name, e)
+            log.error("Shutting down cloud thread due to error...")
             return
 
         batch_tup = itdm.checkout()
@@ -1397,6 +1404,11 @@ class FastmapConfig():
         else:
             self.max_local_workers = os.cpu_count() - 2
 
+        if max_cloud_workers > 100:
+            self.log.warning("More than 100 cloud workers will likely cause "
+                             "the fastmap server to crash. You have %d",
+                             max_cloud_workers)
+
         if not confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
             pass
             # TODO
@@ -1425,9 +1437,9 @@ class FastmapConfig():
             raise FastmapException(f"Unknown return_type '{return_type}'")
         iter_type = str(type(iterable))
         if any(t in iter_type for t in UNSUPPORTED_TYPE_STRS):
-            self.log.warning(f"Type '{iter_type}' is explicitly not supported.")
+            self.log.warning(f"Iterable type '{iter_type}' is explicitly not supported.")
         elif not any(isinstance(iterable, t) for t in SUPPORTED_TYPES):
-            self.log.warning(f"Type '{iter_type}' is not explictly supported.")
+            self.log.warning(f"Iterable type '{iter_type}' is not explictly supported.")
 
         start_time = time.perf_counter()
         is_seq = hasattr(iterable, '__len__')
@@ -1642,6 +1654,7 @@ class _CloudSupervisor(multiprocessing.Process):
             else:
                 self.log.error("In cloud supervisor [%s]: %r.",
                                multiprocessing.current_process().name, e)
+            self.log.error("Shutting down cloud processing due to error...")
             return
 
         threads = []
@@ -1654,9 +1667,11 @@ class _CloudSupervisor(multiprocessing.Process):
             thread = threading.Thread(target=cloud_thread, args=thread_args)
             thread.start()
             threads.append(thread)
+            time.sleep(.1)  # not too many threads opening at once
 
         for thread in threads:
             thread.join()
+        self.log.info("Shutting down cloud processing...")
 
         post_done_args = (self.cloud_url, self.secret, self.log,
                           self.func_hash, self.run_id)
