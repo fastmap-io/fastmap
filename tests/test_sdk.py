@@ -101,6 +101,10 @@ def test_local_basic():
     pi = 4.0 * sum(gen) / len(range_100)
     assert pi == 3.12
 
+    gen = config.fastmap(calc_pi_basic, set(range_100))
+    pi = 4.0 * sum(gen) / len(range_100)
+    assert pi == 3.12
+
 
 def test_return_type_seq():
     assert ReturnType.ELEMENTS == "ELEMENTS"
@@ -340,6 +344,8 @@ def test_single_threaded(monkeypatch):
     assert pi == 3.12
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, iter(range_100))) / len(range_100)
     assert pi == 3.12
+    pi = 4.0 * sum(config.fastmap(calc_pi_basic, set(range_100))) / len(range_100)
+    assert pi == 3.12
 
 
 def test_process_local(monkeypatch):
@@ -350,6 +356,8 @@ def test_process_local(monkeypatch):
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, list(range_100))) / len(range_100)
     assert pi == 3.12
     pi = 4.0 * sum(config.fastmap(calc_pi_basic, iter(range_100))) / len(range_100)
+    assert pi == 3.12
+    pi = 4.0 * sum(config.fastmap(calc_pi_basic, set(range_100))) / len(range_100)
     assert pi == 3.12
 
 

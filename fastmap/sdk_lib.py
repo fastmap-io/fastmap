@@ -33,7 +33,7 @@ SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
 EXECUTION_ENV = "LOCAL"
 CLIENT_VERSION = "0.0.5"
 UNSUPPORTED_TYPE_STRS = ('numpy', 'pandas.DataFrame')
-SUPPORTED_TYPES = (list, range, tuple, Generator)
+SUPPORTED_TYPES = (list, range, tuple, set, Generator)
 KB = 1024
 MB = 1024 ** 2
 GB = 1024 ** 3
@@ -1290,6 +1290,9 @@ class Mapper():
         """
 
         if is_seq:
+            if not hasattr(iterable, '__getitem__'):
+                # We need indexing capability. Iterable likely a set
+                iterable = list(iterable)
             seq_len = len(iterable)
             self.log.info("Applying %r to %d items and yielding the results...",
                           func_name(func), seq_len)
