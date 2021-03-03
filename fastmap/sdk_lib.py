@@ -768,7 +768,7 @@ def cloud_thread(thread_id: str, map_url: str, func_hash: str, label: str,
     """
     batch_tup = itdm.checkout()
     if batch_tup:
-        log.debug("Starting cloud thread %d...", thread_id)
+        log.debug("Starting cloud thread %d []...", thread_id)
     while batch_tup:
         try:
             process_cloud_batch(itdm, batch_tup, map_url, func_hash,
@@ -785,7 +785,8 @@ def cloud_thread(thread_id: str, map_url: str, func_hash: str, label: str,
             else:
                 log.error("In cloud thread [%s]: %r.",
                           threading.current_thread().name, e)
-            log.error("Shutting down cloud thread due to error...")
+            log.error("Shutting down cloud thread [%s] due to error...",
+                      threading.current_thread().name)
             return
 
         batch_tup = itdm.checkout()
@@ -1076,21 +1077,22 @@ class AuthCheck(threading.Thread):
     """
     def __init__(self, config, *args, **kwargs):
         self.secret = config.secret
-        self.url = config.cloud_url + '/api/v1/auth'
+        self.url = config.cloud_url
         self.log = config.log
         super().__init__(*args, **kwargs)
 
     def run(self):
         payload = msgpack.dumps({})
         try:
-            resp = post_request(self.url, payload, self.secret, self.log)
+            resp = post_request(self.url + '/api/v1/auth', payload,
+                                self.secret, self.log)
         except CloudError as ex:
             self.log.error("During auth check [%s]:\n%s.",
                            multiprocessing.current_process().name, ex)
             self.success = False
             return
         if resp.status_code == 200 and resp.status == AuthStatus.AUTHORIZED:
-            self.log.info("Request to %r was successful.", self.url)
+            self.log.info("Authentication for %r was successful.", self.url)
         else:
             self.log.warning("Authentication failed for %r %r. Check your token.",
                              self.url, resp.status)
@@ -1291,7 +1293,8 @@ class Mapper():
 
         if is_seq:
             if not hasattr(iterable, '__getitem__'):
-                # We need indexing capability. Iterable likely a set
+                # Fastmap needs indexing capability.
+                # If a sequence doesn't have __getitem__, it is likely a set
                 iterable = list(iterable)
             seq_len = len(iterable)
             self.log.info("Applying %r to %d items and yielding the results...",
@@ -1439,8 +1442,12 @@ class FastmapConfig():
 
         if self.max_cloud_workers > 100:
             self.log.warning("More than 100 cloud workers will likely cause "
-                             "the fastmap server to crash. You have %d",
+                             "the server to crash. You have %d",
                              self.max_cloud_workers)
+        elif self.max_cloud_workers > 20:
+            self.log.warning("More than 20 cloud workers may cause "
+                             "the server to crash under certain circumstances. "
+                             "You have %d", self.max_cloud_workers)
 
         if not self.confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
             pass
