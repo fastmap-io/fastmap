@@ -3,13 +3,15 @@ Primary file for the fastmap SDK. Almost all client-side code is in this file.
 Do not instantiate anything here directly. Use the interface __init__.py.
 """
 
-import datetime
+import collections
 import distutils.sysconfig
+import functools
 import glob
 import gzip
 import hashlib
 import hmac
 import importlib.metadata
+import json
 import multiprocessing
 import os
 import re
@@ -26,16 +28,14 @@ import dill
 import msgpack
 import requests
 
-CLOUD_URL_BASE = 'https://fastmap.io'
-DEFAULT_MAX_CLOUD_WORKERS = 5
 SECRET_LEN = 64
 SECRET_RE = r'^[0-9a-f]{64}$'
 TASK_RE = r'^[0-9a-f]{5}$'
 SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
 EXECUTION_ENV = "LOCAL"
-CLIENT_VERSION = "0.0.4"
-UNSUPPORTED_TYPE_STRS = ('numpy', 'pandas')
-SUPPORTED_TYPES = (list, range, tuple, Generator)
+CLIENT_VERSION = "0.0.6"
+UNSUPPORTED_TYPE_STRS = ('numpy', 'pandas.DataFrame')
+SUPPORTED_TYPES = (list, range, tuple, set, Generator)
 KB = 1024
 MB = 1024 ** 2
 GB = 1024 ** 3
@@ -48,10 +48,11 @@ FASTMAP_DOCSTRING = """
 
     :param function func: Function to map against.
     :param sequence|generator iterable: Iterable to map over.
+    :param dict kwargs: Named parameters to bind to the function. Optional.
     :param str return_type: Either "ELEMENTS" or "BATCHES". Default
         is "ELEMENTS".
     :param str label: Optional label to track this execution. Only meaningful if
-        some execution occurs on the cloud. Default is emptystring.
+        some execution occurs on the cloud. Default is "".
     :rtype: Generator
 
     Fastmap is a parallelized/distributed drop-in replacement for 'map'.
@@ -73,14 +74,12 @@ FASTMAP_DOCSTRING = """
     """
 
 OFFLOAD_DOCSTRING = """
-    Offload a function to the cloud and return a promise to check in on it.
+    Offload a function to the cloud and return a promise.
 
     :param function func: Function to offload
-    :param list args: Arguments to execute the function with.
-    :param dict kwargs: Kwargs to execute the function with.
-    :param function hook: Function to call upon process completion
-    :param str label: Optional label to track this execution. Only meaningful if
-        some execution occurs on the cloud. Default is emptystring.
+    :param dict kwargs: Named parameters to bind to the function. Optional.
+    :param function hook: Function to call upon process completion. Optional.
+    :param str label: Optional label to track this execution. Default is "".
     :rtype: FastmapPromise
 
     """
@@ -117,6 +116,9 @@ RESULT_DOCSTRING = """
 
 
 INIT_PARAMS = """
+    :param str|file|dict config: The json file path / dict of the
+        configuration. Every subsequent argument will alter this configuration.
+        This is optional and if empty, only subsequent parameters will be used.
     :param str secret: The API token generated on fastmap.io. Treat this like a
         password. Do not commit it to version control! Failure to do so could
         result in man-in-the-middle attacks or your credits being used by others
@@ -129,8 +131,8 @@ INIT_PARAMS = """
         By default, fastmap will start num_cores * 2 - 2.
     :param int max_cloud_workers: Maximum number of cloud workers to start.
         By default, fastmap will start 5.
-    :param dict dependencies: Manually override dependency discovery.
-        See the docs to understand better.
+    :param dict requirements: A dict of requirement->version like
+        {'requests': '2.4.0'}. If omitted, requirement discovery is automatic.
     :param bool confirm_charges: Manually confirm cloud charges.
 
     For more documentation, go to https://fastmap.io/docs
@@ -146,7 +148,7 @@ GLOBAL_INIT_DOCSTRING = """
 
         import fastmap
 
-        fastmap.global_init(secret=FASTMAP_TOKEN)
+        fastmap.global_init(verbosity="LOUD")
         results = fastmap.fastmap(func, iterable)
 
     """ + INIT_PARAMS
@@ -162,11 +164,10 @@ INIT_DOCSTRING = """
 
         import fastmap
 
-        fastmap_config = fastmap.init(secret=FASTMAP_TOKEN)
+        fastmap_config = fastmap.init(verbosity="LOUD")
         results = fastmap_config.fastmap(func, iterable)
 
     """ + INIT_PARAMS
-
 
 dill.settings['recurse'] = True
 
@@ -184,6 +185,49 @@ try:
     multiprocessing.set_start_method("spawn")
 except RuntimeError:
     pass
+
+
+class Namespace(dict):
+    """
+    Abstract constants class
+    Constants can be accessed via .attribute or [key] and can be iterated over.
+    """
+    def __init__(self, *args, **kwargs):
+        d = {k: k for k in args}
+        d.update(dict(kwargs.items()))
+        super().__init__(d)
+
+    def __getattr__(self, item):
+        if item in self:
+            return self[item]
+        raise AttributeError
+
+
+Verbosity = Namespace("SILENT", "QUIET", "NORMAL", "LOUD")
+ExecPolicy = Namespace("ADAPTIVE", "LOCAL", "CLOUD")
+ReturnType = Namespace("ELEMENTS", "BATCHES")
+Color = Namespace(
+    GREEN="\033[92m",
+    RED="\033[91m",
+    YELLOW="\033[93m",
+    CYAN="\033[36m",
+    CANCEL="\033[0m")
+AuthStatus = Namespace("AUTHORIZED")
+InitStatus = Namespace("UPLOADED", "FOUND", "NOT_FOUND")
+MapStatus = Namespace("NOT_FOUND", "BATCH_PROCESSED", "INITALIZING", "INITIALIZATION_ERROR", "PROCESS_ERROR")
+DoneStatus = Namespace("DONE", "NOT_FOUND")
+PromiseState = Namespace("PENDING", "FULFILLED", "REJECTED")
+
+DEFAULT_CONFIG = {
+    'secret': None,
+    'cloud_url': None,
+    'verbosity': Verbosity.NORMAL,
+    'exec_policy': ExecPolicy.ADAPTIVE,
+    'confirm_charges': False,
+    'max_local_workers': None,
+    'max_cloud_workers': 10,
+    'requirements': None,
+}
 
 
 def set_docstring(docstr: str, docstr_prefix='') -> FunctionType:
@@ -205,7 +249,7 @@ def fmt_bytes(num_bytes: int) -> str:
         return "%.1fMB" % (num_bytes / MB)
     if num_bytes >= KB:
         return "%.1fKB" % (num_bytes / KB)
-    return "%.1fB" % num_bytes
+    return "%dB" % num_bytes
 
 
 def fmt_time(num_secs: int) -> str:
@@ -285,33 +329,6 @@ class CloudError(Exception):
         super().__init__(*args, **kwargs)
 
 
-class Namespace(dict):
-    """
-    Abstract constants class
-    Constants can be accessed via .attribute or [key] and can be iterated over.
-    """
-    def __init__(self, *args, **kwargs):
-        d = {k: k for k in args}
-        d.update(dict(kwargs.items()))
-        super().__init__(d)
-
-    def __getattr__(self, item):
-        if item in self:
-            return self[item]
-        raise AttributeError
-
-
-Verbosity = Namespace("SILENT", "QUIET", "NORMAL", "LOUD")
-ExecPolicy = Namespace("ADAPTIVE", "LOCAL", "CLOUD")
-ReturnType = Namespace("ELEMENTS", "BATCHES")
-Color = Namespace(
-    GREEN="\033[92m",
-    RED="\033[91m",
-    YELLOW="\033[93m",
-    CYAN="\033[36m",
-    CANCEL="\033[0m")
-
-
 def simplified_tb(tb: str) -> str:
     """
     Given a traceback, remove fastmap-specific lines (this file + dependencies)
@@ -385,32 +402,27 @@ class FastmapLogger():
         # This instead of a lambda because of pickling in multiprocessing
         pass
 
-    @staticmethod
-    def _debug(msg, *args):
+    def _debug(self, msg, *args):
         if args:
             msg = msg % args
-        print(Color.CYAN + "fastmap DEBUG:" + Color.CANCEL, msg)
+        print("\033[K" + Color.CYAN + "fastmap DEBUG:" + Color.CANCEL, msg)
 
-    @staticmethod
-    def _info(msg, *args):
+    def _info(self, msg, *args):
         if args:
             msg = msg % args
-        print(Color.YELLOW + "fastmap INFO:" + Color.CANCEL, msg)
+        print("\033[K" + Color.YELLOW + "fastmap INFO:" + Color.CANCEL, msg)
 
-    @staticmethod
-    def _warning(msg, *args):
+    def _warning(self, msg, *args):
         if args:
             msg = msg % args
-        print(Color.RED + "fastmap WARNING:" + Color.CANCEL, msg)
+        print("\033[K" + Color.RED + "fastmap WARNING:" + Color.CANCEL, msg)
 
-    @staticmethod
-    def _error(msg, *args):
+    def _error(self, msg, *args):
         if args:
             msg = msg % args
-        print(Color.RED + "fastmap ERROR:" + Color.CANCEL, msg, flush=True)
+        print("\033[K" + Color.RED + "fastmap ERROR:" + Color.CANCEL, msg, flush=True)
 
-    @staticmethod
-    def input(msg):
+    def input(self, msg):
         # This exists mostly for test mocking
         return input(Color.CYAN + "\n fastmap: " + msg + Color.CANCEL)
 
@@ -528,12 +540,18 @@ class InterThreadDataManager():
                         return self._inbox.pop(0)
                     except IndexError:
                         return None
+                    except OSError:
+                        print("Too many threads. Shutting one down...")
+                        sys.exit(0)
 
             with self._lock:
                 try:
                     return self._inbox.pop(0)
                 except IndexError:
                     pass
+                except OSError:
+                    print("Too many threads. Shutting one down...")
+                    sys.exit(0)
             time.sleep(.01)
 
     def push_outbox(self, batch_idx: int, processed_batch: list, runtime: float,
@@ -561,7 +579,7 @@ class InterThreadDataManager():
                 if len(self._outbox):
                     return self._outbox.pop(0)
             if not any(w.is_alive() for w in workers):
-                ex_str = "While trying to get next processed element"
+                ex_str = "Error in pop outbox while trying to get next processed element"
                 raise FastmapException(ex_str)
             time.sleep(.01)
 
@@ -620,14 +638,16 @@ def basic_headers(secret: str, payload: bytes) -> dict:
     }
 
 
-def post_request(url: str, payload: dict, secret: str,
+def post_request(url: str, data: dict, secret: str,
                  log: FastmapLogger) -> requests.Response:
     """
     Generic cloud post wrapper.
     This does warning/error management, extracts content, and checks signatures
     for every API post
     """
-    data = msgpack.dumps(payload)
+    if isinstance(data, dict):
+        data = msgpack.dumps(data)
+
     headers = basic_headers(secret, data)
     try:
         resp = requests.post(url, data=data, headers=headers)
@@ -668,8 +688,8 @@ def post_request(url: str, payload: dict, secret: str,
 
 
 def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
-                        url: str, func_hash: str, label: str, run_id: str,
-                        secret: str, log: FastmapLogger) -> None:
+                        map_url: str, func_hash: str, label: str,
+                        run_id: str, secret: str, log: FastmapLogger) -> None:
     """
     For /api/v1/map, finish preparing the request, send it, and handle the
     response. Processed batches go back into the itdm. If a
@@ -696,27 +716,27 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
         log.debug("Making cloud request batchlen=%d size=%s (%s/el)...",
                   len(batch), fmt_bytes(len(compressed_batch)),
                   fmt_bytes(len(compressed_batch) / len(batch)))
-        resp = post_request(url, payload, secret, log)
+        resp = post_request(map_url, payload, secret, log)
         if resp.status_code == 200:
-            if resp.status == "CREATING_WORKER":
-                log.debug("No cloud workers available. Retrying in 5 seconds...")
-                time.sleep(5)
-                continue
-            elif resp.status == "INIT_WORKER":
-                log.debug("Cloud worker is initializing [%s] (%.1f%%)."
+            if resp.status == MapStatus.INITALIZING:
+                log.debug("Cloud worker is initializing. Last msg [%s]."
                           " Retrying in 5 seconds..." %
-                          (resp.obj.get('init_step', ''),
-                           float(resp.obj.get('init_progress', 0.0)) * 100))
+                          (resp.obj.get('init_step', '')))
                 time.sleep(5)
                 continue
-            elif resp.status == "INIT_WORKER_ERROR":
-                raise CloudError("Error initializing worker %r" %
-                                 resp.obj.get('init_error'))
+            elif resp.status == MapStatus.INITIALIZATION_ERROR:
+                raise CloudError("Error initializing worker %r %r" % (
+                                 resp.obj.get('init_error'), resp.obj.get('init_tb')))
         break
 
-    if resp.status == "PROCESS_DONE":
-        cloud_cid = resp.headers['X-Controller-Id']
-        worker_cid = resp.headers['X-Worker-Id']
+    mem_used = (float(resp.headers.get('X-Mem-Used', 0.0))
+                / float(resp.headers.get('X-Mem-Total', 1.0)))
+    if mem_used > 0.9:
+        log.warning("Cloud memory utilization high: %.2f%%. "
+                    "Consider increasing memory." % mem_used * 100)
+
+    if resp.status == MapStatus.BATCH_PROCESSED:
+        service_id = resp.headers['X-Service-Id']
         total_request = time.perf_counter() - start_req_time
         total_application = float(resp.headers['X-Application-Seconds'])
         total_mapping = float(resp.headers['X-Map-Seconds'])
@@ -728,11 +748,11 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
 
         log.debug("Batch %d cloud cnt=%d "
                   "%.2fs/%.2fs/%.2fs map/app/req (%.2e/%.2e/%.2e per el) "
-                  "[%s/%s].",
+                  "[%s].",
                   batch_idx, result_len,
                   total_mapping, total_application, total_request,
                   map_time_per_el, app_time_per_el, req_time_per_el,
-                  cloud_cid, worker_cid)
+                  service_id)
         itdm.push_outbox(batch_idx,
                          resp.obj['results'],
                          None,
@@ -740,16 +760,19 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
                          network_seconds=total_request - total_application)
         return
 
-    if resp.status == "INTERNAL_FASTMAP_ERROR":
-        raise CloudError("Unexpected cloud error. Try again later.")
-    if resp.status == "WORKER_EXECUTION_ERROR":
+    if resp.status == MapStatus.PROCESS_ERROR:
         # ERROR
-        msg = "Your code could not be processed on the cloud: %r" % \
+        msg = "Your code could not be processed on the cloud: %s. " % \
             resp.obj.get('exception')
         bad_modules = resp.obj.get('bad_modules', [])
         if bad_modules:
-            msg += " Modules with errors on import: %r" % bad_modules
+            msg += "Modules with errors on import: %s." % ' '.join(bad_modules)
+            msg += "You might need to explicitly specify a requirements file " \
+                   "in your deployment."
         raise CloudError(msg, tb=resp.obj.get('traceback', ''))
+    if resp.status == MapStatus.NOT_FOUND:
+        msg = "Your function was not found on the cloud."
+        raise CloudError(msg)
     if resp.status_code == 401:
         # UNAUTHORIZED
         raise CloudError("Unauthorized. Check your API token.")
@@ -771,12 +794,17 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
                          "Find a way to reduce the size of your data or "
                          "function and try again." % fmt_bytes(payload_len))
 
+    if resp.status_code == 500 and resp.headers['Content-Type'] == 'text/html':
+        content = re.sub('<[^<]+?>', '', resp.text)
+        raise CloudError("Unexpected cloud error 500. You might have run out "
+                         "of memory. %s" % content)
+
     # catch all (should just be for 500s of which a few are explicitly defined)
     raise CloudError("Unexpected cloud response %d %s %r" %
                      (resp.status_code, resp.status, resp.obj))
 
 
-def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
+def cloud_thread(thread_id: str, map_url: str, func_hash: str, label: str,
                  run_id: str, itdm: InterThreadDataManager, secret: str,
                  log: FastmapLogger):
     """
@@ -786,10 +814,10 @@ def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
     """
     batch_tup = itdm.checkout()
     if batch_tup:
-        log.debug("Starting cloud thread %d...", thread_id)
+        log.debug("Starting cloud thread %d []...", thread_id)
     while batch_tup:
         try:
-            process_cloud_batch(itdm, batch_tup, url, func_hash,
+            process_cloud_batch(itdm, batch_tup, map_url, func_hash,
                                 label, run_id, secret, log)
         except CloudError as e:
             proc_name = multiprocessing.current_process().name
@@ -797,11 +825,14 @@ def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
             error_loc = "%s: thread:%d" % (proc_name, thread_id)
             itdm.put_error(error_loc, repr(e), batch_tup)
             if hasattr(e, 'tb') and e.tb:
+                tb = e.tb.replace('%0A', '\n')
                 log.error("In cloud thread [%s]:\n%s.",
-                          threading.current_thread().name, e.tb)
+                          threading.current_thread().name, tb)
             else:
                 log.error("In cloud thread [%s]: %r.",
                           threading.current_thread().name, e)
+            log.error("Shutting down cloud thread [%s] due to error...",
+                      threading.current_thread().name)
             return
 
         batch_tup = itdm.checkout()
@@ -809,12 +840,16 @@ def cloud_thread(thread_id: str, url: str, func_hash: str, label: str,
 
 def get_modules(log: FastmapLogger) -> (Dict[str, str], List[ModuleType]):
     """
-    From sys.modules, return the source of local modules and a list of
-    other modules
+    Get in scope modules.
+    Returns two things:
+    1.  a dictionary of all mod_name -> source|None
+    2.  a list of ModuleType for modules found in site packages
+    For the former, a source is included if it is a local module. If it is
+    an installed module, the source is None
     """
     std_lib_dir = distutils.sysconfig.get_python_lib(standard_lib=True)
-    local_module_sources = {}
-    installed_modules = []
+    local_sources = {}
+    installed_mods = []
     for mod_name, mod in sys.modules.items():
         if (mod_name in sys.builtin_module_names or  # not builtin # noqa
             mod_name.startswith("_") or  # not hidden # noqa
@@ -824,33 +859,38 @@ def get_modules(log: FastmapLogger) -> (Dict[str, str], List[ModuleType]):
              mod.__package__ in ("fastmap", "fastmap.fastmap"))):  # not fastmap
                 continue  # noqa
         if SITE_PACKAGES_RE.match(mod.__file__):
-            installed_modules.append(mod)
+            installed_mods.append(mod)
             continue
         if not mod.__file__.endswith('.py'):
             log.warning("The module %r is a non-Python locally-built module "
-                        "which unfortunately cannot be uploaded.", mod)
+                        "which cannot be uploaded.", mod)
             continue
         with open(mod.__file__) as f:
             source = f.read()
             if source:
-                local_module_sources[mod.__name__] = source
+                local_sources[mod.__name__] = source
 
-    return local_module_sources, installed_modules
+    return local_sources, installed_mods
 
 
-def get_requirements(installed_modules: List[ModuleType],
+def get_requirements(installed_mods: List[ModuleType],
                      log: FastmapLogger) -> List[str]:
     """
     Get pip installed requirements which are loaded into the
     """
     imported_module_names = set()
     site_packages_dirs = set()
-    for mod in installed_modules:
+    for mod in installed_mods:
         try:
-            imported_module_names.add(mod.__package__.split('.', 1)[0])
-        except Exception:
-            log.warning("Module %r had no package. This may cause problems "
-                        "when executing in the cloud.", mod)
+            mod_name = mod.__package__
+        except AttributeError:
+            mod_name = None
+        if not mod_name:
+            # TODO
+            # log.warning("Module %r had no __package__. If this causes problems, "
+            #             "try using the 'requirements' parameter.", mod.__name__)
+            mod_name = mod.__name__
+        imported_module_names.add(mod_name)
         site_packages_dirs.add(SITE_PACKAGES_RE.match(mod.__file__).group(0))
 
     top_level_files = set()
@@ -858,7 +898,7 @@ def get_requirements(installed_modules: List[ModuleType],
         top_level_path = site_packages_dir + "*.dist-info/top_level.txt"
         top_level_files.update(glob.glob(top_level_path))
 
-    packages_by_module = {}
+    packages_by_module = collections.defaultdict(set)
     for fn in top_level_files:
         with open(fn) as f:
             modules = f.read().split('\n')
@@ -872,43 +912,73 @@ def get_requirements(installed_modules: List[ModuleType],
         if not pkg_name:
             raise FastmapException("No package name for %r" % fn)
         for mod_name in modules:
-            packages_by_module[mod_name] = pkg_name
+            packages_by_module[mod_name].add(pkg_name)
 
     requirements = {}
+    missed_modules = set()
     for mod_name in imported_module_names:
-        pkg_name = packages_by_module[mod_name]
-        pkg_version = importlib.metadata.version(pkg_name)
-        requirements[pkg_name] = pkg_name + "==" + pkg_version
+        pkg_names = packages_by_module[mod_name]
+        if not pkg_names:
+            # print('\a'); import ipdb; ipdb.set_trace()
+            # log.warning("Could not find version for module %r. Skipping...",
+            #             mod_name)
+            missed_modules.add(mod_name)
+            # requirements[mod_name] = None
+            continue
+        for pkg_name in pkg_names:
+            pkg_version = importlib.metadata.version(pkg_name)
+            requirements[pkg_name] = pkg_version
+
+    # one last run-through to make sure we didn't forget anything
+    # this fixed the issue with google.cloud.vision import
+    for missed_mod in missed_modules:
+        missed_mod = missed_mod.replace('.', '-')
+        try:
+            pkg_version = importlib.metadata.version(missed_mod)
+        except:
+            continue
+        requirements[missed_mod] = pkg_version
+
+    # print('\a'); import ipdb; ipdb.set_trace()
 
     return requirements
 
 
-def get_dependencies(log: FastmapLogger) -> Dict[str, str]:
+def get_dependencies(requirements: dict, log: FastmapLogger) -> (dict, dict):
     """
     Get dependency dictionary.
     Keys are module names.
     Values are either pip version strings or source code.
     """
-    local_module_sources, installed_modules = get_modules(log)
-    requirements = get_requirements(installed_modules, log)
-    return {**local_module_sources, **requirements}
+    local_sources, installed_mods = get_modules(log)
+    requirements = requirements or get_requirements(installed_mods, log)
+    installed_mods = [im.__name__ for im in installed_mods]
+
+    # TODO
+    # req_str = ' '.join(k + "==" + v for k, v in sorted(requirements.items()))
+    # mods_str = ', '.join(sorted(local_sources.keys()))
+    # log.debug("Found %d installed modules" % len(installed_mods))
+    # log.debug("Found requirements [%s]" % req_str)
+    # log.debug("Found local imports [%s]" % mods_str)
+
+    return local_sources, installed_mods, requirements
 
 
-def post_done(cloud_url_base: str, secret: str, log: FastmapLogger,
+def post_done(cloud_url: str, secret: str, log: FastmapLogger,
               func_hash: str, run_id: str) -> None:
     """
     Once fastmap has finished, post done to suggest that the server tidy up.
     If this is not called, the server will do it anyway on a cron schedule.
     """
 
-    url = cloud_url_base + '/api/v1/done'
-    payload = {
+    url = cloud_url + '/api/v1/done'
+    payload = msgpack.dumps({
         "func_hash": func_hash,
         "run_id": run_id
-    }
+    })
     resp = post_request(url, payload, secret, log)
 
-    if resp.status_code != 200:
+    if resp.status_code != 200 or resp.status != DoneStatus.DONE:
         log.error("Error on final api call (%d) %r.",
                   resp.status_code, resp.status)
 
@@ -1005,12 +1075,13 @@ class FillInboxWithSeq(_FillInbox):
         self.itdm.mark_inbox_capped()
 
 
-def seq_progress(seq: Sequence, seq_len: int,
+def seq_progress(seq: Sequence, log: FastmapLogger, seq_len: int,
                  start_time: float) -> Generator:
     """
     Progress printer and counter for sequences
     """
     proc_cnt = 0
+    percenters = list(range(10, 100, 10))
     for batch in seq:
         proc_cnt += len(batch)
         yield batch, proc_cnt
@@ -1018,14 +1089,18 @@ def seq_progress(seq: Sequence, seq_len: int,
         elapsed_time = time.perf_counter() - start_time
         num_left = seq_len - proc_cnt
         time_remaining = elapsed_time * num_left / proc_cnt
-        graph_bar = '█' * int(percent / 2)
-        sys.stdout.write("%sfastmap: %s %.1f%% (%s remaining)\r%s" %
-                         (Color.GREEN, graph_bar, percent,
-                          fmt_time(time_remaining), Color.CANCEL))
+        progress = "%sfastmap: %.1f%% (%s remaining)%s\r" % (
+            Color.GREEN, percent, fmt_time(time_remaining), Color.CANCEL)
+        sys.stdout.write(progress)
         sys.stdout.flush()
+        if not percenters or percent < percenters[0]:
+            continue
+        while percenters and percent >= percenters[0]:
+            percenters = percenters[1:]
+        print(progress[:-1])
 
 
-def gen_progress(gen: Generator, *args) -> Generator:
+def gen_progress(gen: Generator, log: FastmapLogger, *args) -> Generator:
     """
     Progress printer for generators where the length of the generator is
     not known in advance.
@@ -1035,7 +1110,9 @@ def gen_progress(gen: Generator, *args) -> Generator:
     for batch in gen:
         proc_cnt += len(batch)
         yield batch, proc_cnt
-        sys.stdout.write("%sfastmap: Processed %d\r%s" % (Color.GREEN, proc_cnt, Color.CANCEL))
+        progress = "%sfastmap: Processed %d%s\r" % (
+            Color.GREEN, proc_cnt, Color.CANCEL)
+        sys.stdout.write(progress)
         sys.stdout.flush()
 
 
@@ -1046,20 +1123,22 @@ class AuthCheck(threading.Thread):
     """
     def __init__(self, config, *args, **kwargs):
         self.secret = config.secret
-        self.url = config.cloud_url_base + '/api/v1/auth'
+        self.url = config.cloud_url
         self.log = config.log
         super().__init__(*args, **kwargs)
 
     def run(self):
+        payload = msgpack.dumps({})
         try:
-            resp = post_request(self.url, {}, self.secret, self.log)
+            resp = post_request(self.url + '/api/v1/auth', payload,
+                                self.secret, self.log)
         except CloudError as ex:
             self.log.error("During auth check [%s]:\n%s.",
                            multiprocessing.current_process().name, ex)
             self.success = False
             return
-        if resp.status_code == 200:
-            self.log.info("Request to %r was successful.", self.url)
+        if resp.status_code == 200 and resp.status == AuthStatus.AUTHORIZED:
+            self.log.info("Authentication for %r was successful.", self.url)
         else:
             self.log.warning("Authentication failed for %r %r. Check your token.",
                              self.url, resp.status)
@@ -1168,7 +1247,17 @@ class Mapper():
             max_batches_in_queue = self.config.max_local_workers + \
                                    self.config.max_cloud_workers  # noqa
 
-        itdm = InterThreadDataManager(self.avg_runtime, max_batches_in_queue)
+        try:
+            itdm = InterThreadDataManager(self.avg_runtime, max_batches_in_queue)
+        except EOFError as ex:
+            self.log.error("Error starting multiprocessing. To fix, you "
+                           "probably just need to run your code in the main "
+                           "context. E.g:\n"
+                           "if __name__ == '__main__':\n"
+                           "    # start running program here")
+            raise FastmapException(
+                "Error starting multiprocessing. See the "
+                f'"{Color.RED}fastmap ERROR{Color.CANCEL}" above.') from ex
 
         pickled_func = pickle_function(func)
         workers = []
@@ -1252,6 +1341,10 @@ class Mapper():
         """
 
         if is_seq:
+            if not hasattr(iterable, '__getitem__'):
+                # Fastmap needs indexing capability.
+                # If a sequence doesn't have __getitem__, it is likely a set
+                iterable = list(iterable)
             seq_len = len(iterable)
             self.log.info("Applying %r to %d items and yielding the results...",
                           func_name(func), seq_len)
@@ -1314,11 +1407,10 @@ class Mapper():
         self.total_network_seconds = self.itdm.get_total_network_seconds()
 
 
-PromiseState = Namespace("PENDING", "FULFILLED", "REJECTED")
-def local_func_factory(func, args, kwargs):
+def local_func_factory(func, kwargs):
     def local_func(queue):
         try:
-            ret = dill.dumps(func(*args, **kwargs))
+            ret = dill.dumps(func(**kwargs))
         except Exception as ex:
             queue.put((PromiseState.REJECTED, repr(ex)))
         queue.put((PromiseState.FULFILLED, ret))
@@ -1360,8 +1452,8 @@ class FastmapPromise():
         return self._config.exec_policy == ExecPolicy.LOCAL
 
     @staticmethod
-    def create_local(config, func, args, kwargs, hook):
-        local_func = local_func_factory(func, args, kwargs)
+    def create_local(config, func, kwargs, hook):
+        local_func = local_func_factory(func, kwargs)
         local_queue = multiprocessing.Queue()
         proc = multiprocessing.Process(target=local_func,
                                        args=(local_queue,))
@@ -1372,11 +1464,10 @@ class FastmapPromise():
         return fp
 
     @staticmethod
-    def create_cloud(config, func_hash, args, kwargs, hook, label):
+    def create_cloud(config, func_hash, kwargs, hook, label):
         url = config.cloud_url_base + "/api/v1/offload"
         payload = {
             "func_hash": func_hash,
-            "args": args,
             "kwargs": kwargs,
             "label": label,
         }
@@ -1480,34 +1571,55 @@ class FastmapConfig():
         "confirm_charges",
         "max_local_workers",
         "max_cloud_workers",
-        "cloud_url_base",
-        "dependencies",
+        "cloud_url",
+        "requirements",
     ]
 
-    def __init__(self, secret=None, verbosity=Verbosity.NORMAL,
-                 exec_policy=ExecPolicy.ADAPTIVE, confirm_charges=False,
-                 max_local_workers=None, cloud_url_base=CLOUD_URL_BASE,
-                 max_cloud_workers=DEFAULT_MAX_CLOUD_WORKERS,
-                 dependencies=None):
-        if exec_policy not in ExecPolicy:
-            raise FastmapException(f"Unknown exec_policy '{exec_policy}'.")
-        self.exec_policy = exec_policy
-        self.log = FastmapLogger(verbosity)
-        self.verbosity = verbosity
-        self.cloud_url_base = cloud_url_base
-        self.confirm_charges = confirm_charges
-        self.max_cloud_workers = max_cloud_workers
-        self.dependencies = dependencies
+    def __init__(self, config=None, **kwargs):
+        if not config:
+            c = dict(DEFAULT_CONFIG)
+        elif isinstance(config, dict):
+            c = dict(config)
+        elif isinstance(config, str):
+            with open(config) as f:
+                c = json.loads(f.read())
+        else:
+            raise FastmapException(f"Unknown config type {type(config)}")
+
+        for k, v in kwargs.items():
+            if k not in DEFAULT_CONFIG.keys():
+                raise FastmapException(f"Unknown parameter: {k}")
+            c[k] = v
+
+        if c['exec_policy'] not in ExecPolicy:
+            raise FastmapException(f"Unknown exec_policy '{c['exec_policy']}'.")
+        self.exec_policy = c['exec_policy']
+        self.log = FastmapLogger(c['verbosity'])
+        self.verbosity = c['verbosity']
+        self.cloud_url = c['cloud_url']
+        self.confirm_charges = c['confirm_charges']
+        self.max_cloud_workers = c['max_cloud_workers']
+        self.requirements = c['requirements']
+
+        if self.cloud_url:
+            if not self.cloud_url.startswith("http"):
+                self.cloud_url = "http://" + self.cloud_url
+            if self.cloud_url.endswith("/"):
+                self.cloud_url = self.cloud_url[:-1]
+        elif self.exec_policy != ExecPolicy.LOCAL:
+            self.exec_policy = ExecPolicy.LOCAL
+            self.log.warning("No cloud_url provided. "
+                             "Setting exec_policy to LOCAL.")
 
         if multiprocessing.current_process().name != "MainProcess":
             # Fixes issue with multiple loud inits during local multiprocessing
             # in Mac / Windows
             self.log.hush()
 
-        if secret:
-            if not isinstance(secret, str) or not re.match(SECRET_RE, secret):
+        if c['secret']:
+            if not isinstance(c['secret'], str) or not re.match(SECRET_RE, c['secret']):
                 raise FastmapException("Invalid secret token.")
-            self.secret = secret
+            self.secret = c['secret']
         else:
             self.secret = None
             if self.exec_policy != ExecPolicy.LOCAL:
@@ -1515,31 +1627,41 @@ class FastmapConfig():
                 self.log.warning("No secret provided. "
                                  "Setting exec_policy to LOCAL.")
 
-        if dependencies is not None and not isinstance(dependencies, dict):
+        if self.requirements is not None and not isinstance(self.requirements, dict):
             raise FastmapException("Invalid dependencies format.")
 
-        if max_local_workers:
-            self.max_local_workers = max_local_workers
+        if c['max_local_workers']:
+            self.max_local_workers = c['max_local_workers']
         else:
             self.max_local_workers = os.cpu_count() - 2
 
-        if not confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
-            self.log.warning("Your fastmap credit balance will be "
-                             "automatically debited for use. To avoid "
-                             "automatic debits, set confirm_charges=True.")
+        if self.max_cloud_workers > 100:
+            self.log.warning("More than 100 cloud workers will likely cause "
+                             "the server to crash. You have %d",
+                             self.max_cloud_workers)
+        elif self.max_cloud_workers > 20:
+            self.log.warning("More than 20 cloud workers may cause "
+                             "the server to crash under certain circumstances. "
+                             "You have %d", self.max_cloud_workers)
+
+        if not self.confirm_charges and self.exec_policy != ExecPolicy.LOCAL:
+            pass
+            # TODO
+            # self.log.warning("You are set to automatically use cloud "
+            #                  "resources without confirmation. To get "
+            #                  "estimates before usage, set confirm_charges=True.")
 
         self.log.info("Setup fastmap.")
         self.log.info(" verbosity: %s.", self.verbosity)
         self.log.info(" exec_policy: %s.", self.exec_policy)
-        if exec_policy != ExecPolicy.CLOUD:
+        if self.exec_policy != ExecPolicy.CLOUD:
             self.log.info(" max_local_workers: %d.", self.max_local_workers)
-        if exec_policy != ExecPolicy.LOCAL:
+        if self.exec_policy != ExecPolicy.LOCAL:
             self.log.info(" max_cloud_workers: %d.", self.max_cloud_workers)
         self.log.restore_verbosity()  # undo hush
 
     @set_docstring(OFFLOAD_DOCSTRING)
-    def offload(self, func: FunctionType, args=None, kwargs=None, hook=None, label=""):
-        args = args or ()
+    def offload(self, func: FunctionType, kwargs=None, hook=None, label=""):
         kwargs = kwargs or {}
 
         if self.config.confirm_charges:
@@ -1554,19 +1676,16 @@ class FastmapConfig():
                 self.log.warning("Unrecognized input of %r. "
                                  "Please input 'y' or 'n'.", user_input)
 
-        if not isinstance((list, tuple), args):
-            raise FastmapException("'args' must be a list of a tuple")
         if not isinstance(dict, kwargs):
             raise FastmapException("'kwargs' must be a list of a tuple")
 
         if self.exec_policy == ExecPolicy.LOCAL:
-            return FastmapPromise.create_local(self.config, func, args,
-                                               kwargs, hook)
+            return FastmapPromise.create_local(self.config, func, kwargs, hook)
 
         pickled_func = pickle_function(func)
         func_payload, func_hash = get_payload_and_hash(pickled_func, self.config)
         init_remote(self.config, func_hash, func_payload)
-        return FastmapPromise.create_cloud(self.config, func_hash, args, kwargs,
+        return FastmapPromise.create_cloud(self.config, func_hash, kwargs,
                                            hook, label)
 
     @set_docstring(POLL_DOCSTRING)
@@ -1597,7 +1716,7 @@ class FastmapConfig():
         return FastmapPromise(self.config, task_id).result()
 
     @set_docstring(FASTMAP_DOCSTRING)
-    def fastmap(self, func: FunctionType, iterable: Iterable,
+    def fastmap(self, func: FunctionType, iterable: Iterable, kwargs=None,
                 return_type=ReturnType.ELEMENTS, label="") -> Generator:
         """
         Entry for fastmap. This function handles the numerous different
@@ -1608,9 +1727,14 @@ class FastmapConfig():
             raise FastmapException(f"Unknown return_type '{return_type}'")
         iter_type = str(type(iterable))
         if any(t in iter_type for t in UNSUPPORTED_TYPE_STRS):
-            self.log.warning(f"Type '{iter_type}' is explicitly not supported.")
+            self.log.warning(f"Iterable type '{iter_type}' is explicitly not supported.")
         elif not any(isinstance(iterable, t) for t in SUPPORTED_TYPES):
-            self.log.warning(f"Type '{iter_type}' is not explictly supported.")
+            self.log.warning(f"Iterable type '{iter_type}' is not explictly supported.")
+
+        if kwargs:
+            if not isinstance(kwargs, dict):
+                raise FastmapException("Parameter 'kwargs' must be a dict.")
+            func = functools.partial(func, **kwargs)
 
         start_time = time.perf_counter()
         is_seq = hasattr(iterable, '__len__')
@@ -1641,11 +1765,13 @@ class FastmapConfig():
             progress_func = seq_progress if is_seq else gen_progress
 
             if return_type == ReturnType.BATCHES:
-                for batch, proc_cnt in progress_func(fm, seq_len, start_time):
+                for batch, proc_cnt in progress_func(fm, self.log, seq_len,
+                                                     start_time):
                     yield batch
             else:
                 # else return_type is ELEMENTS
-                for batch, proc_cnt in progress_func(fm, seq_len, start_time):
+                for batch, proc_cnt in progress_func(fm, self.log, seq_len,
+                                                     start_time):
                     for el in batch:
                         yield el
 
@@ -1718,32 +1844,50 @@ def chunk_bytes(payload: bytes, size: int) -> list:
 
 
 def init_remote(config, func_hash, func_payload):
-    payload = {}
+    """
+    Get the function and modules uploaded to the cloud via the
+    /api/v1/init endpoint. This must happen BEFORE calling /api/v1/map.
+    Because of server-side caching, and the potential for very large
+    payloads, check with the function hash before uploading the function.
+    """
 
     # Step 1: Try just uploaded the function hash. If it exists, we are good.
-    payload['func_hash'] = func_hash
+    req_dict = {}
+    req_dict['func_hash'] = func_hash
     url = config.cloud_url_base + "/api/v1/init"
+    payload = msgpack.dumps(req_dict)
     resp = post_request(url, payload, config.secret, config.log)
 
     if resp.status_code != 200:
         raise CloudError("Cloud initialization failed %r." % resp.obj)
-    if resp.status == 'EXISTS':
+    if resp.status == InitStatus.FOUND:
+        config.log.info("Function already on the server.")
         return
+    if resp.status != InitStatus.NOT_FOUND:
+        raise CloudError("Unexpected init status %r." % resp.obj)
 
     # Step 2: If the server can't find the func, we need to upload it
     # We might need to chunk the upload due to cloud run limits
     func_parts = chunk_bytes(func_payload, 20 * MB)
     for i, func_part in enumerate(func_parts):
-        payload['func'] = func_part
-        payload['payload_part'] = i
-        payload['payload_len'] = len(func_parts)
+        req_dict['func'] = func_part
+        req_dict['payload_part'] = i
+        req_dict['payload_len'] = len(func_parts)
+        payload = msgpack.dumps(req_dict)
+        payload_bytes = fmt_bytes(len(payload))
+        if len(func_parts) > 1:
+            config.log.info("Uploading code (%s) part %d/%d..." %
+                            (payload_bytes, i + 1, len(func_parts)))
+        else:
+            config.log.info("Uploading code (%s)..." % payload_bytes)
         resp = post_request(url, payload, config.secret, config.log)
 
         if resp.status_code != 200:
             raise CloudError("Cloud initialization failed %r." % resp.obj)
-        if resp.status == 'UPLOADED':
+        if resp.status == InitStatus.UPLOADED:
             continue
         raise CloudError("Cloud initialization failed. Function not uploaded.")
+    config.log.info("Done uploading code.")
     return
 
 
@@ -1768,26 +1912,25 @@ class _CloudSupervisor(multiprocessing.Process):
                  config: FastmapConfig, label: str):
         multiprocessing.Process.__init__(self)
 
-        self.func_payload, self.func_hash = get_payload_and_hash(pickled_func,
-                                                                 config)
+        local_sources, installed_mods, requirements = get_dependencies(
+            config.requirements, config.log)
+        encoded_func = msgpack.dumps({
+            'func': pickled_func,
+            'local_sources': local_sources,
+            'installed_mods': installed_mods,
+            'requirements': requirements})
+        self.func_payload = gzip.compress(encoded_func, compresslevel=1)
+        self.func_hash = get_func_hash(self.func_payload)
         self.itdm = itdm
 
         self.config = config
         self.process_name = multiprocessing.current_process().name
         self.label = label
         self.run_id = secrets.token_hex(8)
-        self.log.info("Started cloud supervisor for remote url (%r). "
-                      "Function payload size is %s.",
-                      self.config.cloud_url_base, fmt_bytes(len(self.func_payload)))
-
-    def init_remote(self):
-        """
-        Get the function and modules uploaded to the cloud via the
-        /api/v1/init endpoint. This must happen BEFORE calling /api/v1/map.
-        Because of server-side caching, and the potential for very large
-        payloads, check with the function hash before uploading the function.
-        """
-        init_remote(self.config, self.func_hash, self.func_payload)
+        self.config.log.info("Started cloud supervisor for remote url (%r). "
+                             "Function payload size is %s.",
+                             self.config.cloud_url,
+                             fmt_bytes(len(self.func_payload)))
 
     def run(self):
         """
@@ -1796,7 +1939,7 @@ class _CloudSupervisor(multiprocessing.Process):
         push more to the cloud.
         """
         try:
-            self.init_remote()
+            init_remote(self.config, self.func_hash, self.func_payload)
         except CloudError as e:
             self.config.log.error("In cloud supervisor during init [%s]: %r.",
                                   multiprocessing.current_process().name, e)
@@ -1806,19 +1949,21 @@ class _CloudSupervisor(multiprocessing.Process):
         if not batch_tup:
             return
 
-        map_endpoint = self.config.cloud_url_base + '/api/v1/map'
+        map_url = self.config.cloud_url + '/api/v1/map'
         try:
-            process_cloud_batch(self.itdm, batch_tup, map_endpoint,
+            process_cloud_batch(self.itdm, batch_tup, map_url,
                                 self.func_hash, self.label,
                                 self.run_id, self.config.secret, self.config.log)
         except CloudError as e:
             self.itdm.put_error(self.process_name, repr(e), batch_tup)
             if hasattr(e, 'tb') and e.tb:
+                tb = e.tb.replace('%0A', '\n')
                 self.config.log.error("In cloud supervisor [%s]:\n%s.",
-                                      multiprocessing.current_process().name, e.tb)
+                                      multiprocessing.current_process().name, tb)
             else:
                 self.config.log.error("In cloud supervisor [%s]: %r.",
                                       multiprocessing.current_process().name, e)
+            self.config.log.error("Shutting down cloud processing due to error...")
             return
 
         threads = []
@@ -1826,17 +1971,19 @@ class _CloudSupervisor(multiprocessing.Process):
                                 self.itdm.inbox_len())
         self.config.log.debug("Opening %d cloud connection(s)...", num_cloud_threads)
         for thread_id in range(num_cloud_threads):
-            thread_args = (thread_id, map_endpoint, self.func_hash, self.label,
+            thread_args = (thread_id, map_url, self.func_hash, self.label,
                            self.run_id, self.itdm, self.config.secret,
                            self.config.log)
             thread = threading.Thread(target=cloud_thread, args=thread_args)
             thread.start()
             threads.append(thread)
+            time.sleep(.1)  # not too many threads opening at once
 
         for thread in threads:
             thread.join()
+        self.config.log.info("Shutting down cloud processing...")
 
-        post_done_args = (self.config.cloud_url_base, self.config.secret,
+        post_done_args = (self.config.cloud_url, self.config.secret,
                           self.config.log, self.func_hash, self.run_id)
         done_thread = threading.Thread(target=post_done, args=post_done_args)
         done_thread.start()
