@@ -5,6 +5,7 @@ Do not instantiate anything here directly. Use the interface __init__.py.
 
 import collections
 import distutils.sysconfig
+import functools
 import glob
 import gzip
 import hashlib
@@ -46,6 +47,7 @@ FASTMAP_DOCSTRING = """
 
     :param function func: Function to map against.
     :param sequence|generator iterable: Iterable to map over.
+    :param dict kwargs: Named parameters to bind to the function. Optional.
     :param str return_type: Either "ELEMENTS" or "BATCHES". Default
         is "ELEMENTS".
     :param str label: Optional label to track this execution. Only meaningful if
@@ -533,7 +535,7 @@ class InterThreadDataManager():
                 if len(self._outbox):
                     return self._outbox.pop(0)
             if not any(w.is_alive() for w in workers):
-                ex_str = "While trying to get next processed element"
+                ex_str = "Error in pop outbox while trying to get next processed element"
                 raise FastmapException(ex_str)
             time.sleep(.01)
 
@@ -1466,7 +1468,7 @@ class FastmapConfig():
         self.log.restore_verbosity()  # undo hush
 
     @set_docstring(FASTMAP_DOCSTRING)
-    def fastmap(self, func: FunctionType, iterable: Iterable,
+    def fastmap(self, func: FunctionType, iterable: Iterable, kwargs=None,
                 return_type=ReturnType.ELEMENTS, label="") -> Generator:
         """
         Entry for fastmap. This function handles the numerous different
@@ -1480,6 +1482,11 @@ class FastmapConfig():
             self.log.warning(f"Iterable type '{iter_type}' is explicitly not supported.")
         elif not any(isinstance(iterable, t) for t in SUPPORTED_TYPES):
             self.log.warning(f"Iterable type '{iter_type}' is not explictly supported.")
+
+        if kwargs:
+            if not isinstance(kwargs, dict):
+                raise FastmapException("Parameter 'kwargs' must be a dict.")
+            func = functools.partial(func, **kwargs)
 
         start_time = time.perf_counter()
         is_seq = hasattr(iterable, '__len__')

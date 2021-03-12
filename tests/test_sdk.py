@@ -225,9 +225,7 @@ def test_local_global_init():
 def test_local_functools():
     config = init(exec_policy="LOCAL")
     range_100 = range(100)
-    _calc_pi_basic = functools.partial(calc_pi_basic, two=2.0)
-
-    pi = 4.0 * sum(config.fastmap(_calc_pi_basic, range_100)) / len(range_100)
+    pi = 4.0 * sum(config.fastmap(calc_pi_basic, range_100, kwargs={'two': 2.0})) / len(range_100)
     assert pi == 3.12
 
 
