@@ -33,7 +33,7 @@ SECRET_RE = r'^[0-9a-f]{64}$'
 TASK_RE = r'^[0-9a-f]{5}$'
 SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
 EXECUTION_ENV = "LOCAL"
-CLIENT_VERSION = "0.0.6"
+CLIENT_VERSION = "0.0.7"
 UNSUPPORTED_TYPE_STRS = ('numpy', 'pandas.DataFrame')
 SUPPORTED_TYPES = (list, range, tuple, set, Generator)
 KB = 1024
@@ -91,7 +91,7 @@ POLL_DOCSTRING = """
 
     If the task_id is omitted, return every cloud task.
 
-    :param str task_id: task_id
+    :param str task_id:
     :rtype: list[dict]
     """
 
@@ -100,7 +100,7 @@ KILL_DOCSTRING = """
 
     Raises a FastmapException if the task cannot be found or is already dead.
 
-    :param str task_id: task_id
+    :param str task_id:
     :rtype: None
     """
 
@@ -110,8 +110,28 @@ RESULT_DOCSTRING = """
     Raises a FastmapException if the result cannot be found or the
     task has not completed.
 
-    :param str task_id: task_id
+    :param str task_id:
     :rtype: Various
+    """
+
+LOGS_DOCSTRING = """
+    Given a task_id, return the function's stdout and stderr.
+
+    Raises a FastmapException if the task cannot be found or the
+    task has not completed.
+
+    :param str logs:
+    :rtype: str
+    """
+
+CLEAR_DOCSTRING = """
+    Given a task_id, clear the task and remove its function, logs, and result from storage.
+
+    Raises a FastmapException if the task cannot be found or the
+    task has not completed.
+
+    :param str task_id:
+    :rtype: None
     """
 
 
@@ -217,6 +237,7 @@ InitStatus = Namespace("UPLOADED", "FOUND", "NOT_FOUND")
 MapStatus = Namespace("NOT_FOUND", "BATCH_PROCESSED", "INITALIZING", "INITIALIZATION_ERROR", "PROCESS_ERROR")
 DoneStatus = Namespace("DONE", "NOT_FOUND")
 PromiseState = Namespace("PENDING", "FULFILLED", "REJECTED")
+TaskState = Namespace("PENDING", "PROCESSING", "DONE", "CLEARED")
 
 DEFAULT_CONFIG = {
     'secret': None,
@@ -1152,7 +1173,7 @@ class AuthCheck(threading.Thread):
 
 def pickle_function(func):
     try:
-        pickled_func = dill.dumps(func, recurse=True)
+        return dill.dumps(func, recurse=True)
     except Exception as ex:
         func_name = getattr(func, "__name__", str(func))
         err = "Your function %r could not be pickled." % func_name
@@ -1513,11 +1534,11 @@ class FastmapPromise():
         }
         resp = post_request(url, payload, self.config.secret, self.config.log)
 
-        worker_state = resp.obj.get("state")
-        if worker_state == "RUNNING":
+        task_state = resp.obj.get("state")
+        if task_state in (TaskState.PENDING, TaskState.PROCESSING):
             return PromiseState.PENDING
 
-        if worker_state == "OK":
+        if task_state in (TaskState.DONE, TaskState.CLEARED):
             self._state = PromiseState.FULFILLED
             self._result = resp.obj.get('result')
 
@@ -1537,7 +1558,7 @@ class FastmapPromise():
 
         url = self.config.cloud_url_base + "/api/v1/kill"
         payload = {
-            "worker_id": self._task_id
+            "task_id": self._task_id
         }
         post_request(url, payload, self.config.secret, self.config.log)
 
@@ -1545,12 +1566,30 @@ class FastmapPromise():
         while True:
             state = self.poll()
             if state == PromiseState.FULFILLED:
-                self._result
+                return self._result
             if state == PromiseState.REJECTED:
                 raise self._exception
             if not block:
                 raise FastmapException("Promise not resolved")
             time.sleep(self.POLLING_TIMEOUT)
+
+    def logs(self):
+        url = self.config.cloud_url_base + "/api/v1/logs"
+        payload = {
+            "task_id": self._task_id
+        }
+        resp = post_request(url, payload, self.config.secret, self.config.log)
+        return resp['logs']
+
+    def clear(self):
+        state = self.poll()
+        if state == PromiseState.PENDING:
+            raise FastmapException("Promise not resolved")
+        url = self.config.cloud_url_base + "/api/v1/clear"
+        payload = {
+            "task_id": self._task_id
+        }
+        post_request(url, payload, self.config.secret, self.config.log)
 
 
 class FastmapConfig():
@@ -1691,7 +1730,7 @@ class FastmapConfig():
     @set_docstring(POLL_DOCSTRING)
     def poll(self, task_id):
         if self.exec_policy == ExecPolicy.LOCAL:
-            raise FastmapException("Status is not available for "
+            raise FastmapException("'status' is not available for "
                                    "ExecPolicy.LOCAL. Use the promise object.")
         if not (task_id is None or TASK_RE.match(task_id)):
             raise FastmapException("Bad task_id %r" % task_id)
@@ -1700,7 +1739,7 @@ class FastmapConfig():
     @set_docstring(KILL_DOCSTRING)
     def kill(self, task_id):
         if self.exec_policy == ExecPolicy.LOCAL:
-            raise FastmapException("Kill is not available for "
+            raise FastmapException("'kill' is not available for "
                                    "ExecPolicy.LOCAL. Use the promise object.")
         if not TASK_RE.match(task_id):
             raise FastmapException("Bad task_id %r" % task_id)
@@ -1709,11 +1748,21 @@ class FastmapConfig():
     @set_docstring(RESULT_DOCSTRING)
     def result(self, task_id):
         if self.exec_policy == ExecPolicy.LOCAL:
-            raise FastmapException("Result is not available for "
+            raise FastmapException("'result' is not available for "
                                    "ExecPolicy.LOCAL. Use the promise object.")
         if not TASK_RE.match(task_id):
             raise FastmapException("Bad task_id %r" % task_id)
         return FastmapPromise(self.config, task_id).result()
+
+    @set_docstring(CLEAR_DOCSTRING)
+    def clear(self, task_id):
+        if self.exec_policy == ExecPolicy.LOCAL:
+            raise FastmapException("'clear' is not available for "
+                                   "ExecPolicy.LOCAL. Use the promise object.")
+        if not TASK_RE.match(task_id):
+            raise FastmapException("Bad task_id %r" % task_id)
+        return FastmapPromise(self.config, task_id).clear()
+
 
     @set_docstring(FASTMAP_DOCSTRING)
     def fastmap(self, func: FunctionType, iterable: Iterable, kwargs=None,
@@ -1855,8 +1904,7 @@ def init_remote(config, func_hash, func_payload):
     req_dict = {}
     req_dict['func_hash'] = func_hash
     url = config.cloud_url_base + "/api/v1/init"
-    payload = msgpack.dumps(req_dict)
-    resp = post_request(url, payload, config.secret, config.log)
+    resp = post_request(url, req_dict, config.secret, config.log)
 
     if resp.status_code != 200:
         raise CloudError("Cloud initialization failed %r." % resp.obj)

@@ -22,15 +22,15 @@ setuptools.setup(
     version=version,
     author="fastmap.io team",
     author_email="scott@fastmap.io",
-    description="Fastmap is a drop-in replacement for `map` that " \
-                "parallelizes your code on the cloud.",
+    description="Fastmap offloads and parallelizes arbitrary Python code "
+                "via the free and open-source fastmap-server.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url=url_base,
     download_url=download_url,
     packages=setuptools.find_packages(),
     scripts=[
-        "scripts/fastmap",
+        # "scripts/fastmap",
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

@@ -1,6 +1,5 @@
 import base64
 import gzip
-import functools
 import io
 import math
 import pickle
@@ -19,9 +18,8 @@ import requests_mock
 sys.path.append(os.getcwd().split('/tests')[0])
 
 from fastmap import (init, global_init, fastmap, _reset_global_config,
-                     FastmapException, sdk_lib, FastmapConfig, ReturnType,
+                     FastmapException, sdk_lib, ReturnType,
                      Verbosity, ExecPolicy)
-# from fastmap.lib import FastmapConfig
 
 TEST_SECRET = "abcd" * (64 // 4)
 

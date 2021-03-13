@@ -1,7 +1,8 @@
 from .sdk_lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity,
                       FastmapException, ReturnType, CLIENT_VERSION, INIT_DOCSTRING,
                       GLOBAL_INIT_DOCSTRING, FASTMAP_DOCSTRING, OFFLOAD_DOCSTRING,
-                      POLL_DOCSTRING, KILL_DOCSTRING, RESULT_DOCSTRING)
+                      POLL_DOCSTRING, KILL_DOCSTRING, RESULT_DOCSTRING, CLEAR_DOCSTRING,
+                      LOGS_DOCSTRING)
 
 ExecPolicy = ExecPolicy
 Verbosity = Verbosity
@@ -57,6 +58,15 @@ def kill(task_id):
 def result(task_id):
     return _get_config().result(task_id)
 
+
+@set_docstring(LOGS_DOCSTRING)
+def logs(task_id):
+    return _get_config().logs(task_id)
+
+
+@set_docstring(CLEAR_DOCSTRING)
+def clear(task_id):
+    return _get_config().clear(task_id)
 
 
 def _reset_global_config():
