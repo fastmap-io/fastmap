@@ -3,9 +3,14 @@ import re
 import setuptools
 import sys
 
-if sys.version_info[:2] < (3, 7):
-    print("ERROR: this package requires Python 3.7 or later!")
+if sys.version_info[:2] < (3, 6):
+    print("ERROR: this package requires Python 3.6 or later!")
     sys.exit(1)
+if sys.version_info[:2] >= (3, 9):
+    print("ERROR: this package cannot run on Python 3.9 or later!")
+    # TODO. It's a pickling issue. Maybe dill needs a PR?
+    sys.exit(1)
+
 
 with open("README.md", "r") as fh:
     long_description = fh.read()
@@ -30,14 +35,14 @@ setuptools.setup(
     download_url=download_url,
     packages=setuptools.find_packages(),
     scripts=[
-        # "scripts/fastmap",
+        "scripts/fastmap",
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires='>=3.6',
+    python_requires='>=3.6<3.9',
     install_requires=[
         "dill>=0.3.2,<0.4",
         "msgpack>=1.0.0,<1.1.0",

@@ -4,6 +4,8 @@ Do not instantiate anything here directly. Use the interface __init__.py.
 """
 
 import collections
+import contextlib
+import datetime
 import distutils.sysconfig
 import functools
 import glob
@@ -14,6 +16,7 @@ import importlib.metadata
 import json
 import multiprocessing
 import os
+import queue
 import re
 import secrets
 import sys
@@ -30,7 +33,7 @@ import requests
 
 SECRET_LEN = 64
 SECRET_RE = r'^[0-9a-f]{64}$'
-TASK_RE = r'^[0-9a-f]{5}$'
+TASK_RE = r'^[0-9a-f]{8}$'
 SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
 EXECUTION_ENV = "LOCAL"
 CLIENT_VERSION = "0.0.7"
@@ -74,25 +77,29 @@ FASTMAP_DOCSTRING = """
     """
 
 OFFLOAD_DOCSTRING = """
-    Offload a function to the cloud and return a promise.
+    Offload a function to the cloud and return a FastmapTask.
 
     :param function func: Function to offload
     :param dict kwargs: Named parameters to bind to the function. Optional.
     :param function hook: Function to call upon process completion. Optional.
     :param str label: Optional label to track this execution. Default is "".
-    :rtype: FastmapPromise
 
+    :rtype: FastmapTask
+    """
+
+POLL_ALL_DOCSTRING = """
+    Poll all non-CLEARED cloud task metadata.
+
+    :rtype: list[dict]
     """
 
 POLL_DOCSTRING = """
-    Given a task_id, poll cloud task statuses.
-    The task_id can be obtained from the FastmapPromise object returned from
-    an offload operation.
+    Given a task_id, poll for cloud task metadata.
 
-    If the task_id is omitted, return every cloud task.
+    Raises a FastmapException if the task cannot be found.
 
     :param str task_id:
-    :rtype: list[dict]
+    :rtype: dict
     """
 
 KILL_DOCSTRING = """
@@ -101,7 +108,6 @@ KILL_DOCSTRING = """
     Raises a FastmapException if the task cannot be found or is already dead.
 
     :param str task_id:
-    :rtype: None
     """
 
 RESULT_DOCSTRING = """
@@ -117,11 +123,10 @@ RESULT_DOCSTRING = """
 LOGS_DOCSTRING = """
     Given a task_id, return the function's stdout and stderr.
 
-    Raises a FastmapException if the task cannot be found or the
-    task has not completed.
+    Raises a FastmapException if the task cannot be found.
 
     :param str logs:
-    :rtype: str
+    :rtype: dict
     """
 
 CLEAR_DOCSTRING = """
@@ -131,8 +136,11 @@ CLEAR_DOCSTRING = """
     task has not completed.
 
     :param str task_id:
-    :rtype: None
     """
+
+CLEAR_ALL_DOCSTRING = """
+    Clear all done tasks and remove their functions, logs, and results from storage.
+"""
 
 
 INIT_PARAMS = """
@@ -236,8 +244,7 @@ AuthStatus = Namespace("AUTHORIZED")
 InitStatus = Namespace("UPLOADED", "FOUND", "NOT_FOUND")
 MapStatus = Namespace("NOT_FOUND", "BATCH_PROCESSED", "INITALIZING", "INITIALIZATION_ERROR", "PROCESS_ERROR")
 DoneStatus = Namespace("DONE", "NOT_FOUND")
-PromiseState = Namespace("PENDING", "FULFILLED", "REJECTED")
-TaskState = Namespace("PENDING", "PROCESSING", "DONE", "CLEARED")
+TaskState = Namespace("PENDING", "PROCESSING", "KILLING", "DONE", "CLEARED")
 
 DEFAULT_CONFIG = {
     'secret': None,
@@ -670,11 +677,16 @@ def post_request(url: str, data: dict, secret: str,
         data = msgpack.dumps(data)
 
     headers = basic_headers(secret, data)
+    log.debug("Posting to url %s with %s", url, fmt_bytes(len(data)))
     try:
+        # TODO should this be in a backoff loop for robustness?
+        # Would that make sense for all post requests??
         resp = requests.post(url, data=data, headers=headers)
     except requests.exceptions.ConnectionError:
+        ping_url = url.split('/api')[0] + '/api/v1/ping'
         raise CloudError("Fastmap could not connect to %r. "
-                         "Check your connection." % url) from None
+                         "Check your network connection. To check if your "
+                         "server is running, try: `curl %s`." % (url, ping_url)) from None
     if 'X-Server-Warning' in resp.headers:
         # deprecations or anything else
         log.warning(resp.headers['X-Server-Warning'])
@@ -682,9 +694,14 @@ def post_request(url: str, data: dict, secret: str,
     if resp.status_code == 500:
         raise CloudError("Fastmap cloud error: %r" % resp.content)
 
+    if resp.status_code == 401:
+        # UNAUTHORIZED
+        raise CloudError("Unauthorized. Check your API token.")
+
     if resp.headers.get('Content-Type') == 'application/msgpack':
         resp.obj = msgpack.loads(resp.content)
         resp.status = resp.headers['X-Status']
+        log.debug("Response %s %s", resp.status_code, resp.status)
     elif resp.headers.get('Content-Type') == 'application/octet-stream':
         if 'X-Content-Signature' not in resp.headers:
             raise CloudError("Cloud payload was not signed (%d). "
@@ -782,7 +799,6 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
         return
 
     if resp.status == MapStatus.PROCESS_ERROR:
-        # ERROR
         msg = "Your code could not be processed on the cloud: %s. " % \
             resp.obj.get('exception')
         bad_modules = resp.obj.get('bad_modules', [])
@@ -794,9 +810,6 @@ def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
     if resp.status == MapStatus.NOT_FOUND:
         msg = "Your function was not found on the cloud."
         raise CloudError(msg)
-    if resp.status_code == 401:
-        # UNAUTHORIZED
-        raise CloudError("Unauthorized. Check your API token.")
     if resp.status_code == 402:
         # NOT_ENOUGH_CREDITS
         raise CloudError("Insufficient credits for this request. "
@@ -940,7 +953,6 @@ def get_requirements(installed_mods: List[ModuleType],
     for mod_name in imported_module_names:
         pkg_names = packages_by_module[mod_name]
         if not pkg_names:
-            # print('\a'); import ipdb; ipdb.set_trace()
             # log.warning("Could not find version for module %r. Skipping...",
             #             mod_name)
             missed_modules.add(mod_name)
@@ -959,8 +971,6 @@ def get_requirements(installed_mods: List[ModuleType],
         except:
             continue
         requirements[missed_mod] = pkg_version
-
-    # print('\a'); import ipdb; ipdb.set_trace()
 
     return requirements
 
@@ -1428,168 +1438,272 @@ class Mapper():
         self.total_network_seconds = self.itdm.get_total_network_seconds()
 
 
-def local_func_factory(func, kwargs):
-    def local_func(queue):
-        try:
-            ret = dill.dumps(func(**kwargs))
-        except Exception as ex:
-            queue.put((PromiseState.REJECTED, repr(ex)))
-        queue.put((PromiseState.FULFILLED, ret))
-    return local_func
+class LogsIO():
+    def __init__(self, logs_queue):
+        self.logs_queue = logs_queue
+        self.is_open = True
+
+    def write(self, s):
+        self.logs_queue.put(s)
+        return len(s)
 
 
-def promise_hook_thread(promise, hook):
+def func_wrapper(pickled_func, result_queue, logs_queue):
+    kwargs = {}
+    func = dill.loads(pickled_func)
+    logs = LogsIO(logs_queue)
+    start_time = datetime.datetime.now()
+    with contextlib.redirect_stderr(logs):
+        with contextlib.redirect_stdout(logs):
+            try:
+                ret = func(**kwargs)
+                resp = {
+                    'outcome': 'SUCCESS',
+                    'return': ret,
+                    'exception': None,
+                    'tb': None,
+                }
+            except Exception as ex:
+                resp = {
+                    'outcome': 'ERROR',
+                    'return': None,
+                    'exception': repr(ex),
+                    'tb': simplified_tb(),
+                }
+    runtime = (datetime.datetime.now() - start_time).total_seconds()
+    result_queue.put((dill.dumps(resp), runtime))
+
+
+def task_hook_thread(task, hook):
     try:
-        result = promise.result()
-    except Exception:
+        ret = task.wait()
+    except:
         return
-    hook(result)
+    hook(ret)
 
 
-class FastmapPromise():
-    POLLING_TIMEOUT = 5
+OfldStatus = Namespace("NOT_FOUND", "STARTING_WORKER", "ERROR")
 
-    def __init__(self, config, proc=None, local_queue=None, task_id=None):
+
+class FastmapTask():
+    POLLING_TIMEOUT = 1
+
+    def add_hook(self, hook):
+        t = threading.Thread(target=task_hook_thread, args=(self, hook))
+        t.start()
+
+    def wait(self, timeout=None):
+        while True:
+            if self._outcome == 'SUCCESS':
+                return self._return
+            if self._outcome == 'ERROR':
+                self._config.log.info(self._tb)
+                raise FastmapException("Server error %r", self._exception)
+            if self._outcome == 'KILLED':
+                return self._return
+            self.poll()
+            if self._task_state == TaskState.DONE:
+                return self._get_result()
+            if self._task_state == TaskState.CLEARED:
+                raise FastmapException("Task has been cleared")
+            if self._task_state == TaskState.KILLING:
+                return None
+            time.sleep(timeout or self.POLLING_TIMEOUT)
+
+
+class FastmapLocalTask(FastmapTask):
+    def __init__(self, config, func, proc=None, result_queue=None,
+                 logs_queue=None):
+        self.task_id = secrets.token_hex()[:8]
         self._config = config
-        self._state =None
-        self._result = None
+        self._task_state = TaskState.PENDING
+        self._outcome = None
+        self._return = None
         self._exception = None
+        self._tb = None
+        self._runtime = None
 
-        if self._is_local():
-            self._proc = proc
-            self._local_queue = local_queue
-            self.task_id = None
-        else:
-            self._proc = None
-            self._local_queue = None
-            self.task_id = task_id
+        self._func_name = func_name(func)
+        self._proc = proc
+        self._result_queue = result_queue
+        self._logs_queue = logs_queue
+        self._logs = ""
+        self._starttime = datetime.datetime.now()
 
     def __repr__(self):
-        if self._is_local():
-            return "<FastmapPromise LOCAL %s>" % (self._state)
-        return "<FastmapPromise %s %s>" % (self.task_id, self._state)
-
-    def _is_local(self):
-        return self._config.exec_policy == ExecPolicy.LOCAL
+        return "<FastmapTask LOCAL last_state=%s>" % (self._task_state)
 
     @staticmethod
-    def create_local(config, func, kwargs, hook):
-        local_func = local_func_factory(func, kwargs)
-        local_queue = multiprocessing.Queue()
-        proc = multiprocessing.Process(target=local_func,
-                                       args=(local_queue,))
+    def create(config, func, kwargs, hook):
+        pickled_func = dill.dumps(func)
+        result_queue = multiprocessing.Queue()
+        logs_queue = multiprocessing.Queue()
+        proc = multiprocessing.Process(target=func_wrapper,
+                                       args=(pickled_func, result_queue,
+                                             logs_queue))
         proc.start()
-        fp = FastmapPromise(config, proc=proc, local_queue=local_queue)
+        fp = FastmapLocalTask(config, func, proc=proc,
+                              result_queue=result_queue,
+                              logs_queue=logs_queue)
         if hook:
             fp.add_hook(hook)
         return fp
 
+    def poll(self):
+        try:
+            result, self._runtime = self._result_queue.get(block=False)
+            result = dill.loads(result)
+            self._task_state = TaskState.DONE
+            self._outcome = result['outcome']
+            self._return = result['return']
+            self._exception = result['exception']
+            self._tb = result['tb']
+        except queue.Empty:
+            pass
+
+        return {
+            'func_name': self._func_name,
+            "task_id": self.task_id,
+            'start_time': datetime.datetime.fromtimestamp(self._starttime),
+            "task_state": self._task_state,
+            'outcome': self._outcome,
+            'runtime': self._runtime,
+        }
+
+    def kill(self):
+        self._task_state = TaskState.KILLING
+        self._proc.terminate()
+        self._outcome = "KILLED"
+        self._task_state = TaskState.DONE
+        self._config.log.info("Killing task %s...", self.task_id)
+        self.poll()
+
+    def _get_result(self):
+        self.poll()
+        if self._outcome is None:
+            raise FastmapException("Result not ready")
+        if self._outcome == 'SUCCESS':
+            return self._return
+        raise FastmapException("Result not successful")
+
+    def logs(self):
+        while True:
+            try:
+                self._logs += self._logs_queue.get(block=False)
+            except queue.Empty:
+                break
+        return self._logs
+
+    def clear(self):
+        if not self._task_state == TaskState.DONE:
+            raise FastmapException("Task not done")
+        self._task_state = TaskState.CLEARED
+        self._config.log.info("Clearing task %s...", self.task_id)
+
+
+class FastmapCloudTask(FastmapTask):
+    def __init__(self, config, task_id=None):
+        self.task_id = task_id
+        self._config = config
+        self._task_state = TaskState.PENDING
+        self._outcome = None
+        self._return = None
+        self._exception = None
+        self._tb = None
+
+    def __repr__(self):
+        return "<FastmapTask task_id=%s last_state=%s>" % (self.task_id, self._task_state)
+
     @staticmethod
-    def create_cloud(config, func_hash, kwargs, hook, label):
-        url = config.cloud_url_base + "/api/v1/offload"
+    def create(config, func, func_hash, kwargs, hook, label):
+        url = config.cloud_url + "/api/v1/offload"
         payload = {
+            "func_name": func_name(func),
             "func_hash": func_hash,
             "kwargs": kwargs,
             "label": label,
         }
-        while True:
-            resp = post_request(url, payload, config.secret, config.log)
-            if resp.status == "INTERNAL_FASTMAP_ERROR":
-                raise FastmapException("Internal cloud error. Try again later.")
-            if resp.status == "CREATING_WORKER":
-                config.warning("No cloud workers available. Retrying in 5 seconds...")
-                time.sleep(5)
-                continue
-            if resp.status == "WORKER_STARTED":
-                fp = FastmapPromise(config, task_id=resp.obj['task_id'])
-                if hook:
-                    fp.add_hook(hook)
-                return fp
-            raise FastmapException("Got unexpected response from server %r" % resp.status)
+        resp = post_request(url, payload, config.secret, config.log)
+        if resp.status in (OfldStatus.ERROR, OfldStatus.NOT_FOUND):
+            raise FastmapException("Internal cloud error. Try again later.")
 
-    def add_hook(self, hook):
-        t = threading.Thread(target=promise_hook_thread, args=(self, hook))
-        t.start()
+        if resp.status == OfldStatus.STARTING_WORKER:
+            fp = FastmapCloudTask(config, task_id=resp.obj['task_id'])
+            if hook:
+                fp.add_hook(hook)
+            return fp
+        raise FastmapException("Got unexpected response from server %r" % resp.status)
 
     def poll(self):
-        if self._state != PromiseState.PENDING:
-            return self._state
-
-        if self._is_local():
-            try:
-                resp = self.local_queue.get(block=False)
-            except multiprocessing.Queue.Empty:
-                return PromiseState.PENDING
-            if resp[0] == PromiseState.FULFILLED:
-                self._state = PromiseState.FULFILLED
-                self._result = resp[1]
-            else:
-                self._state = PromiseState.REJECTED
-                self._exception = resp[1]
-            return self._state
-
-        url = self.config.cloud_url_base + "/api/v1/poll"
-        payload = {
-            "task_id": self._task_id
-        }
-        resp = post_request(url, payload, self.config.secret, self.config.log)
-
-        task_state = resp.obj.get("state")
-        if task_state in (TaskState.PENDING, TaskState.PROCESSING):
-            return PromiseState.PENDING
-
-        if task_state in (TaskState.DONE, TaskState.CLEARED):
-            self._state = PromiseState.FULFILLED
-            self._result = resp.obj.get('result')
-
-        self._state = PromiseState.REJECTED
-        self._exception = resp.obj.get('exception')
-        if not self._exception:
-            self._exception = FastmapException("Execution failed with no exception.")
-        return self._state
+        url = self._config.cloud_url + "/api/v1/poll"
+        payload = {"task_id": self.task_id}
+        resp = post_request(url, payload, self._config.secret, self._config.log)
+        if resp.status == 'NOT_FOUND':
+            raise FastmapException("No task found")
+        if resp.status == 'FOUND':
+            task_dict = resp.obj['task']
+            task_dict['start_time'] = datetime.datetime.fromtimestamp(task_dict['start_time'])
+            self._task_state = task_dict['task_state']
+            return task_dict
+        raise FastmapException("Unexpected status from server %r" % resp.status)
 
     def kill(self):
-        if self._state != PromiseState.PENDING:
+        url = self._config.cloud_url + "/api/v1/kill"
+        payload = {"task_id": self.task_id}
+        resp = post_request(url, payload, self._config.secret, self._config.log)
+        if resp.status == 'FOUND':
+            self._config.log.info("Killing task %s...", self.task_id)
+            self.poll()
             return
+        if resp.status == 'NOT_FOUND':
+            raise FastmapException("No task found")
+        raise FastmapException("Unexpected status from server %r" % resp.status)
 
-        if self._is_local():
-            self.proc.terminate()
-            self._state = PromiseState.REJECTED
-
-        url = self.config.cloud_url_base + "/api/v1/kill"
-        payload = {
-            "task_id": self._task_id
-        }
-        post_request(url, payload, self.config.secret, self.config.log)
-
-    def result(self, block=True):
-        while True:
-            state = self.poll()
-            if state == PromiseState.FULFILLED:
-                return self._result
-            if state == PromiseState.REJECTED:
-                raise self._exception
-            if not block:
-                raise FastmapException("Promise not resolved")
-            time.sleep(self.POLLING_TIMEOUT)
+    def _get_result(self):
+        print('\a'); import ipdb; ipdb.set_trace()
+        if self._outcome == 'SUCCESS':
+            return self._return
+        if self._outcome:
+            raise FastmapException("Function not successful")
+        url = self._config.cloud_url + "/api/v1/result"
+        payload = {"task_id": self.task_id}
+        resp = post_request(url, payload, self._config.secret, self._config.log)
+        if resp.status == 'NOT_FOUND':
+            raise FastmapException("No task found")
+        if resp.status == 'NOT_READY':
+            raise FastmapException("Result not ready")
+        if resp.status == "SUCCESS":
+            self._outcome = "SUCCESS"
+            self._return = resp.obj['return']
+        if resp.status == "ERROR":
+            self._outcome = "ERROR"
+            self._exception = resp.obj['exception']
+            self._tb = resp.obj['tb']
+        raise FastmapException("Unexpected status from server %r" % resp.status)
 
     def logs(self):
-        url = self.config.cloud_url_base + "/api/v1/logs"
-        payload = {
-            "task_id": self._task_id
-        }
-        resp = post_request(url, payload, self.config.secret, self.config.log)
-        return resp['logs']
+        url = self._config.cloud_url + "/api/v1/logs"
+        payload = {"task_id": self.task_id}
+        resp = post_request(url, payload, self._config.secret, self._config.log)
+        if resp.status == 'NOT_FOUND':
+            raise FastmapException("No task found")
+        if resp.status == 'FOUND':
+            return resp.obj['logs']
+        raise FastmapException("Unexpected status from server %r" % resp.status)
 
     def clear(self):
-        state = self.poll()
-        if state == PromiseState.PENDING:
-            raise FastmapException("Promise not resolved")
-        url = self.config.cloud_url_base + "/api/v1/clear"
-        payload = {
-            "task_id": self._task_id
-        }
-        post_request(url, payload, self.config.secret, self.config.log)
+        url = self._config.cloud_url + "/api/v1/clear"
+        payload = {"task_id": self.task_id}
+        resp = post_request(url, payload, self._config.secret, self._config.log)
+        if resp.status == 'NOT_FOUND':
+            raise FastmapException("No task found")
+        if resp.status == 'NOT_READY':
+            raise FastmapException("Task not cleared. Task status is not \"DONE\".")
+        if resp.status == 'FOUND':
+            self._config.log.info("Clearing task %s...", self.task_id)
+            self.poll()
+            return
+        raise FastmapException("Unexpected status from server %r" % resp.status)
 
 
 class FastmapConfig():
@@ -1620,8 +1734,11 @@ class FastmapConfig():
         elif isinstance(config, dict):
             c = dict(config)
         elif isinstance(config, str):
-            with open(config) as f:
-                c = json.loads(f.read())
+            try:
+                with open(config) as f:
+                    c = json.loads(f.read())
+            except Exception as e:
+                raise FastmapException(f"Exception loading config '{config}'") from e
         else:
             raise FastmapException(f"Unknown config type {type(config)}")
 
@@ -1657,7 +1774,7 @@ class FastmapConfig():
 
         if c['secret']:
             if not isinstance(c['secret'], str) or not re.match(SECRET_RE, c['secret']):
-                raise FastmapException("Invalid secret token.")
+                raise FastmapException("Invalid secret token format.")
             self.secret = c['secret']
         else:
             self.secret = None
@@ -1703,7 +1820,7 @@ class FastmapConfig():
     def offload(self, func: FunctionType, kwargs=None, hook=None, label=""):
         kwargs = kwargs or {}
 
-        if self.config.confirm_charges:
+        if self.confirm_charges:
             while True:
                 user_input_query = "Offloading a function will incur " \
                                    "charges. Continue?"
@@ -1715,54 +1832,85 @@ class FastmapConfig():
                 self.log.warning("Unrecognized input of %r. "
                                  "Please input 'y' or 'n'.", user_input)
 
-        if not isinstance(dict, kwargs):
+        if not isinstance(kwargs, dict):
             raise FastmapException("'kwargs' must be a list of a tuple")
 
         if self.exec_policy == ExecPolicy.LOCAL:
-            return FastmapPromise.create_local(self.config, func, kwargs, hook)
+            return FastmapLocalTask.create(self, func=func, kwargs=kwargs,
+                                           hook=hook)
 
         pickled_func = pickle_function(func)
-        func_payload, func_hash = get_payload_and_hash(pickled_func, self.config)
-        init_remote(self.config, func_hash, func_payload)
-        return FastmapPromise.create_cloud(self.config, func_hash, kwargs,
-                                           hook, label)
+        func_payload, func_hash = get_payload_and_hash(pickled_func, self)
+        init_remote(self, func_hash, func_payload)
+        return FastmapCloudTask.create(self, func, func_hash=func_hash,
+                                       kwargs=kwargs, hook=hook, label=label)
 
     @set_docstring(POLL_DOCSTRING)
     def poll(self, task_id):
         if self.exec_policy == ExecPolicy.LOCAL:
-            raise FastmapException("'status' is not available for "
-                                   "ExecPolicy.LOCAL. Use the promise object.")
-        if not (task_id is None or TASK_RE.match(task_id)):
-            raise FastmapException("Bad task_id %r" % task_id)
-        return FastmapPromise(self.config, task_id).poll()
+            raise FastmapException("'poll' is not available for "
+                                   "ExecPolicy.LOCAL. Use .offload first.")
+        if not task_id or not re.match(TASK_RE, task_id):
+            raise FastmapException("Invalid task_id format %r" % task_id)
+        return FastmapCloudTask(self, task_id=task_id).poll()
+
+
+    @set_docstring(POLL_ALL_DOCSTRING)
+    def poll_all(self):
+        if self.exec_policy == ExecPolicy.LOCAL:
+            raise FastmapException("'poll_all' is not available for "
+                                   "ExecPolicy.LOCAL.")
+        resp = post_request(self.cloud_url + '/api/v1/poll_all', {},
+                            self.secret, self.log)
+        tasks = resp.obj['tasks']
+        for task in tasks:
+            task['start_time'] = datetime.datetime.fromtimestamp(task['start_time'])
+        return tasks
 
     @set_docstring(KILL_DOCSTRING)
     def kill(self, task_id):
         if self.exec_policy == ExecPolicy.LOCAL:
             raise FastmapException("'kill' is not available for "
-                                   "ExecPolicy.LOCAL. Use the promise object.")
-        if not TASK_RE.match(task_id):
-            raise FastmapException("Bad task_id %r" % task_id)
-        return FastmapPromise(self.config, task_id).kill()
+                                   "ExecPolicy.LOCAL. Use .offload first.")
+        if not re.match(TASK_RE, task_id):
+            raise FastmapException("Invalid task_id format %r" % task_id)
+        return FastmapCloudTask(self, task_id=task_id).kill()
 
     @set_docstring(RESULT_DOCSTRING)
     def result(self, task_id):
         if self.exec_policy == ExecPolicy.LOCAL:
             raise FastmapException("'result' is not available for "
-                                   "ExecPolicy.LOCAL. Use the promise object.")
-        if not TASK_RE.match(task_id):
-            raise FastmapException("Bad task_id %r" % task_id)
-        return FastmapPromise(self.config, task_id).result()
+                                   "ExecPolicy.LOCAL. Use .offload first.")
+        if not re.match(TASK_RE, task_id):
+            raise FastmapException("Invalid task_id format %r" % task_id)
+        return FastmapCloudTask(self, task_id=task_id)._get_result()
 
     @set_docstring(CLEAR_DOCSTRING)
     def clear(self, task_id):
         if self.exec_policy == ExecPolicy.LOCAL:
             raise FastmapException("'clear' is not available for "
-                                   "ExecPolicy.LOCAL. Use the promise object.")
-        if not TASK_RE.match(task_id):
-            raise FastmapException("Bad task_id %r" % task_id)
-        return FastmapPromise(self.config, task_id).clear()
+                                   "ExecPolicy.LOCAL. Use .offload first.")
+        if not re.match(TASK_RE, task_id):
+            raise FastmapException("Invalid task_id format %r" % task_id)
+        return FastmapCloudTask(self, task_id=task_id).clear()
 
+    @set_docstring(CLEAR_ALL_DOCSTRING)
+    def clear_all(self):
+        if self.exec_policy == ExecPolicy.LOCAL:
+            raise FastmapException("'clear' is not available for "
+                                   "ExecPolicy.LOCAL. Use .offload first.")
+        resp = post_request(self.cloud_url + '/api/v1/clear_all', {},
+                            self.secret, self.log)
+        self.log.info("Cleared %d tasks", resp.obj['count'])
+
+    @set_docstring(LOGS_DOCSTRING)
+    def logs(self, task_id):
+        if self.exec_policy == ExecPolicy.LOCAL:
+            raise FastmapException("'logs' is not available for "
+                                   "ExecPolicy.LOCAL. Use .offload first.")
+        if not re.match(TASK_RE, task_id):
+            raise FastmapException("Invalid task_id format %r" % task_id)
+        return FastmapCloudTask(self, task_id=task_id).logs()
 
     @set_docstring(FASTMAP_DOCSTRING)
     def fastmap(self, func: FunctionType, iterable: Iterable, kwargs=None,
@@ -1831,7 +1979,7 @@ class FastmapConfig():
                         worker_error = mapper.itdm.get_error()
                         errors.append(" Worker error [%s]: %s" % (
                                       worker_error[0], worker_error[1]))
-                except multiprocessing.queues.Empty:
+                except queue.Empty:
                     pass
             mapper.cleanup()
 
@@ -1903,7 +2051,7 @@ def init_remote(config, func_hash, func_payload):
     # Step 1: Try just uploaded the function hash. If it exists, we are good.
     req_dict = {}
     req_dict['func_hash'] = func_hash
-    url = config.cloud_url_base + "/api/v1/init"
+    url = config.cloud_url + "/api/v1/init"
     resp = post_request(url, req_dict, config.secret, config.log)
 
     if resp.status_code != 200:
@@ -1940,16 +2088,18 @@ def init_remote(config, func_hash, func_payload):
 
 
 def get_payload_and_hash(pickled_func, config):
-    if isinstance(config.dependencies, dict):
-        dependencies = config.dependencies
-    else:
-        dependencies = get_dependencies(config.log)
+    local_sources, installed_mods, requirements = get_dependencies(
+        config.requirements, config.log)
     encoded_func = msgpack.dumps({
         'func': pickled_func,
-        'dependencies': dependencies})
+        'local_sources': local_sources,
+        'installed_mods': installed_mods,
+        'requirements': requirements})
     func_payload = gzip.compress(encoded_func, compresslevel=1)
     func_hash = get_func_hash(func_payload)
     return func_payload, func_hash
+
+
 
 
 class _CloudSupervisor(multiprocessing.Process):
@@ -1960,15 +2110,7 @@ class _CloudSupervisor(multiprocessing.Process):
                  config: FastmapConfig, label: str):
         multiprocessing.Process.__init__(self)
 
-        local_sources, installed_mods, requirements = get_dependencies(
-            config.requirements, config.log)
-        encoded_func = msgpack.dumps({
-            'func': pickled_func,
-            'local_sources': local_sources,
-            'installed_mods': installed_mods,
-            'requirements': requirements})
-        self.func_payload = gzip.compress(encoded_func, compresslevel=1)
-        self.func_hash = get_func_hash(self.func_payload)
+        self.func_payload, self.func_hash = get_payload_and_hash(pickled_func, config)
         self.itdm = itdm
 
         self.config = config
