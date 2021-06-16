@@ -11,6 +11,7 @@ import tabulate
 import fastmap
 
 USAGE = """Fastmap CLI for running arbitrary Python functions on the cloud.
+This CLI only supports the offload workflow and doesn't have any mapping functionality.
 Run `fastmap --help` for more details.
 """
 
@@ -138,7 +139,7 @@ if __name__ == "__main__":
         'poll', help="Get the metadata of one or all tasks")
     poll_p.add_argument(
         "task_id", nargs='?',
-        help="If omitted, return all non-CLEARED tasks")
+        help="Which task to return specifically. If omitted, return all non-CLEARED tasks")
 
     logs_p = subparsers.add_parser(
         'logs',

@@ -663,6 +663,7 @@ def basic_headers(secret: str, payload: bytes) -> dict:
         'X-Python-Version': sys.version.replace('\n', ''),
         'X-Client-Version': CLIENT_VERSION,
         'X-Content-Signature': hmac_digest(secret, payload),
+        'X-Request-ID': secrets.token_hex()[:5],
     }
 
 
@@ -698,11 +699,8 @@ def post_request(url: str, data: dict, secret: str,
         # UNAUTHORIZED
         raise CloudError("Unauthorized. Check your API token.")
 
-    if resp.headers.get('Content-Type') == 'application/msgpack':
-        resp.obj = msgpack.loads(resp.content)
-        resp.status = resp.headers['X-Status']
-        log.debug("Response %s %s", resp.status_code, resp.status)
-    elif resp.headers.get('Content-Type') == 'application/octet-stream':
+    if resp.status_code == 200 and \
+       resp.headers.get('Content-Type') == 'application/msgpack':
         if 'X-Content-Signature' not in resp.headers:
             raise CloudError("Cloud payload was not signed (%d). "
                              "Will not unpickle." % (resp.status_code))
@@ -710,19 +708,23 @@ def post_request(url: str, data: dict, secret: str,
         if resp.headers['X-Content-Signature'] != cloud_hash:
             raise CloudError("Cloud checksum did not match. Will not unpickle.")
         resp.status = resp.headers['X-Status']
+        log.debug("Response %s %s", resp.status_code, resp.status)
         try:
-            resp.obj = dill.loads(gzip.decompress(resp.content))
+            resp.obj = msgpack.loads(resp.content)
+            if 'result' in resp.obj:
+                resp.obj['result'] = dill.loads(gzip.decompress(resp.obj['result']))
         except gzip.BadGzipFile:
             raise CloudError("Error unzipping response") from None
         except dill.UnpicklingError:
             raise CloudError("Error unpickling response") from None
-    else:
-        raise CloudError("Unexpected Content-Type %r (%d): %r" %
-                         (resp.headers.get("Content-Type"),
-                          resp.status_code,
-                          resp.content[:100].strip()))
+        except msgpack.UnpicklingError:  # TODO
+            raise CloudError("Error unpacking response") from None
+        return resp
 
-    return resp
+    raise CloudError("Unexpected Status / Content-Type %d (%s): %r" %
+                     (resp.status_code,
+                      resp.headers.get("Content-Type"),
+                      resp.content[:100].strip()))
 
 
 def process_cloud_batch(itdm: InterThreadDataManager, batch_tup: tuple,
@@ -1486,14 +1488,20 @@ OfldStatus = Namespace("NOT_FOUND", "STARTING_WORKER", "ERROR")
 
 
 class FastmapTask():
-    POLLING_TIMEOUT = 1
+    POLLING_TIMEOUT = 3
 
     def add_hook(self, hook):
         t = threading.Thread(target=task_hook_thread, args=(self, hook))
         t.start()
 
-    def wait(self, timeout=None):
+    def wait(self, timeout=None, live_logs=False):
         while True:
+            if live_logs:
+                logs = self.logs()
+                if logs:
+                    print(logs)
+            else:
+                self.poll()
             if self._outcome == 'SUCCESS':
                 return self._return
             if self._outcome == 'ERROR':
@@ -1501,7 +1509,6 @@ class FastmapTask():
                 raise FastmapException("Server error %r", self._exception)
             if self._outcome == 'KILLED':
                 return self._return
-            self.poll()
             if self._task_state == TaskState.DONE:
                 return self._get_result()
             if self._task_state == TaskState.CLEARED:
@@ -1527,7 +1534,7 @@ class FastmapLocalTask(FastmapTask):
         self._proc = proc
         self._result_queue = result_queue
         self._logs_queue = logs_queue
-        self._logs = ""
+        self._all_logs = ""
         self._starttime = datetime.datetime.now()
 
     def __repr__(self):
@@ -1586,13 +1593,18 @@ class FastmapLocalTask(FastmapTask):
             return self._return
         raise FastmapException("Result not successful")
 
-    def logs(self):
+    def logs(self, all_logs=False):
+        new_logs = b''
         while True:
             try:
-                self._logs += self._logs_queue.get(block=False)
+                new_logs += self._logs_queue.get(block=False)
             except queue.Empty:
                 break
-        return self._logs
+        self._all_logs += new_logs.decode()
+        if all_logs:
+            return self._logs
+        else:
+            return new_logs.decode()
 
     def clear(self):
         if not self._task_state == TaskState.DONE:
@@ -1606,6 +1618,9 @@ class FastmapCloudTask(FastmapTask):
         self.task_id = task_id
         self._config = config
         self._task_state = TaskState.PENDING
+        self._next_log_idx = 0
+        self._all_logs = ''
+        self._logs_done = False
         self._outcome = None
         self._return = None
         self._exception = None
@@ -1623,18 +1638,20 @@ class FastmapCloudTask(FastmapTask):
             "kwargs": kwargs,
             "label": label,
         }
+        config.log.debug("Calling /api/v1/offload")
         resp = post_request(url, payload, config.secret, config.log)
         if resp.status in (OfldStatus.ERROR, OfldStatus.NOT_FOUND):
             raise FastmapException("Internal cloud error. Try again later.")
 
         if resp.status == OfldStatus.STARTING_WORKER:
-            fp = FastmapCloudTask(config, task_id=resp.obj['task_id'])
+            fp = FastmapCloudTask(config, task_id=resp.obj['task']['task_id'])
             if hook:
                 fp.add_hook(hook)
             return fp
         raise FastmapException("Got unexpected response from server %r" % resp.status)
 
     def poll(self):
+        self._config.log.debug("Calling /api/v1/poll")
         url = self._config.cloud_url + "/api/v1/poll"
         payload = {"task_id": self.task_id}
         resp = post_request(url, payload, self._config.secret, self._config.log)
@@ -1642,29 +1659,67 @@ class FastmapCloudTask(FastmapTask):
             raise FastmapException("No task found")
         if resp.status == 'FOUND':
             task_dict = resp.obj['task']
-            task_dict['start_time'] = datetime.datetime.fromtimestamp(task_dict['start_time'])
-            self._task_state = task_dict['task_state']
+            task_dict['start_time'] = datetime.datetime.fromtimestamp(task_dict['start_time'])  # TODO do we just want to do this for all responses?
+            self._task_state = resp.obj['task']['task_state']
             return task_dict
         raise FastmapException("Unexpected status from server %r" % resp.status)
 
     def kill(self):
+        self._config.log.debug("Calling /api/v1/kill")
         url = self._config.cloud_url + "/api/v1/kill"
         payload = {"task_id": self.task_id}
         resp = post_request(url, payload, self._config.secret, self._config.log)
-        if resp.status == 'FOUND':
-            self._config.log.info("Killing task %s...", self.task_id)
-            self.poll()
-            return
         if resp.status == 'NOT_FOUND':
             raise FastmapException("No task found")
+        if resp.status == 'FOUND':
+            self._config.log.info("Server killed task %s...", self.task_id)
+            self._task_state = resp.obj['task']['task_state']
+            return
+        raise FastmapException("Unexpected status from server %r" % resp.status)
+
+    def logs(self, all_logs=False):
+        if self._logs_done:
+            if all_logs:
+                return self._all_logs
+            return ""
+        self._config.log.debug("Calling /api/v1/logs")
+        url = self._config.cloud_url + "/api/v1/logs"
+        payload = {"task_id": self.task_id, "next_log_idx": self._next_log_idx}
+        resp = post_request(url, payload, self._config.secret, self._config.log)
+        if resp.status == 'NOT_FOUND':
+            raise FastmapException("No task found")
+        if resp.status == 'FOUND':
+            self._next_log_idx = resp.obj['next_log_idx']
+            self._all_logs += resp.obj['logs'].decode()
+            self._task_state = resp.obj['task']['task_state']
+            if self._task_state in (TaskState.DONE, TaskState.CLEARED):
+                self._logs_done = True
+            if all_logs:
+                return self._all_logs
+            return resp.obj['logs'].decode()
+        raise FastmapException("Unexpected status from server %r" % resp.status)
+
+    def clear(self):
+        self._config.log.debug("Calling /api/v1/clear")
+        url = self._config.cloud_url + "/api/v1/clear"
+        payload = {"task_id": self.task_id}
+        resp = post_request(url, payload, self._config.secret, self._config.log)
+        if resp.status == 'NOT_FOUND':
+            raise FastmapException("No task found")
+        if resp.status == 'NOT_READY':
+            raise FastmapException("Task not cleared. Task status is not \"DONE\".")
+        if resp.status == 'FOUND':
+            self._config.log.info("Server cleared task %s...", self.task_id)
+            self._task_state = resp.obj['task']['task_state']
+            return
         raise FastmapException("Unexpected status from server %r" % resp.status)
 
     def _get_result(self):
-        print('\a'); import ipdb; ipdb.set_trace()
         if self._outcome == 'SUCCESS':
             return self._return
         if self._outcome:
             raise FastmapException("Function not successful")
+        self._config.log.debug("Calling /api/v1/result")
         url = self._config.cloud_url + "/api/v1/result"
         payload = {"task_id": self.task_id}
         resp = post_request(url, payload, self._config.secret, self._config.log)
@@ -1674,35 +1729,15 @@ class FastmapCloudTask(FastmapTask):
             raise FastmapException("Result not ready")
         if resp.status == "SUCCESS":
             self._outcome = "SUCCESS"
-            self._return = resp.obj['return']
+            self._return = resp.obj['result']['return']
+            self._task_state = resp.obj['task']['task_state']
+            return self._return
         if resp.status == "ERROR":
             self._outcome = "ERROR"
             self._exception = resp.obj['exception']
             self._tb = resp.obj['tb']
-        raise FastmapException("Unexpected status from server %r" % resp.status)
-
-    def logs(self):
-        url = self._config.cloud_url + "/api/v1/logs"
-        payload = {"task_id": self.task_id}
-        resp = post_request(url, payload, self._config.secret, self._config.log)
-        if resp.status == 'NOT_FOUND':
-            raise FastmapException("No task found")
-        if resp.status == 'FOUND':
-            return resp.obj['logs']
-        raise FastmapException("Unexpected status from server %r" % resp.status)
-
-    def clear(self):
-        url = self._config.cloud_url + "/api/v1/clear"
-        payload = {"task_id": self.task_id}
-        resp = post_request(url, payload, self._config.secret, self._config.log)
-        if resp.status == 'NOT_FOUND':
-            raise FastmapException("No task found")
-        if resp.status == 'NOT_READY':
-            raise FastmapException("Task not cleared. Task status is not \"DONE\".")
-        if resp.status == 'FOUND':
-            self._config.log.info("Clearing task %s...", self.task_id)
-            self.poll()
-            return
+            self._task_state = resp.obj['task']['task_state']
+            raise FastmapException("Function not successful")
         raise FastmapException("Unexpected status from server %r" % resp.status)
 
 
@@ -1753,6 +1788,7 @@ class FastmapConfig():
         self.log = FastmapLogger(c['verbosity'])
         self.verbosity = c['verbosity']
         self.cloud_url = c['cloud_url']
+        # self.live_logs = c['live_logs']
         self.confirm_charges = c['confirm_charges']
         self.max_cloud_workers = c['max_cloud_workers']
         self.requirements = c['requirements']
@@ -1833,7 +1869,7 @@ class FastmapConfig():
                                  "Please input 'y' or 'n'.", user_input)
 
         if not isinstance(kwargs, dict):
-            raise FastmapException("'kwargs' must be a list of a tuple")
+            raise FastmapException("'kwargs' must be a dict")
 
         if self.exec_policy == ExecPolicy.LOCAL:
             return FastmapLocalTask.create(self, func=func, kwargs=kwargs,
@@ -1853,7 +1889,6 @@ class FastmapConfig():
         if not task_id or not re.match(TASK_RE, task_id):
             raise FastmapException("Invalid task_id format %r" % task_id)
         return FastmapCloudTask(self, task_id=task_id).poll()
-
 
     @set_docstring(POLL_ALL_DOCSTRING)
     def poll_all(self):
@@ -2064,7 +2099,7 @@ def init_remote(config, func_hash, func_payload):
 
     # Step 2: If the server can't find the func, we need to upload it
     # We might need to chunk the upload due to cloud run limits
-    func_parts = chunk_bytes(func_payload, 20 * MB)
+    func_parts = chunk_bytes(func_payload, 5 * MB)  # TODO I dont' really have a good reason for 5MB but 2 felt like not enough and 10 too much.
     for i, func_part in enumerate(func_parts):
         req_dict['func'] = func_part
         req_dict['payload_part'] = i
@@ -2098,8 +2133,6 @@ def get_payload_and_hash(pickled_func, config):
     func_payload = gzip.compress(encoded_func, compresslevel=1)
     func_hash = get_func_hash(func_payload)
     return func_payload, func_hash
-
-
 
 
 class _CloudSupervisor(multiprocessing.Process):
@@ -2145,6 +2178,8 @@ class _CloudSupervisor(multiprocessing.Process):
                                 self.func_hash, self.label,
                                 self.run_id, self.config.secret, self.config.log)
         except CloudError as e:
+            # TODO label this error better. I think it's coming from the cloud and
+            # not the cloud supervisor???
             self.itdm.put_error(self.process_name, repr(e), batch_tup)
             if hasattr(e, 'tb') and e.tb:
                 tb = e.tb.replace('%0A', '\n')
