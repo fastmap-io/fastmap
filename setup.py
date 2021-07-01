@@ -4,12 +4,12 @@ import setuptools
 import sys
 
 if sys.version_info[:2] < (3, 6):
-    print("ERROR: this package requires Python 3.6 or later!")
+    print("ERROR: this package requires Python 3.7 or later!")
     sys.exit(1)
-if sys.version_info[:2] >= (3, 9):
-    print("ERROR: this package cannot run on Python 3.9 or later!")
-    # TODO. It's a pickling issue. Maybe dill needs a PR?
-    sys.exit(1)
+# if sys.version_info[:2] >= (3, 9):
+#     # This is because of a pickling issue. Maybe dill needs a PR?
+#     print("ERROR: this package cannot run on Python 3.9 or later!")
+#     sys.exit(1)
 
 
 with open("README.md", "r") as fh:
@@ -27,8 +27,8 @@ setuptools.setup(
     version=version,
     author="fastmap.io team",
     author_email="scott@fastmap.io",
-    description="Fastmap offloads and parallelizes arbitrary Python code "
-                "via the free and open-source fastmap-server.",
+    description="Fastmap offloads arbitrary Python code "
+                "via the open source fastmap cloud service.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url=url_base,
@@ -42,7 +42,7 @@ setuptools.setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires='>=3.6<3.9',
+    python_requires='>=3.7',
     install_requires=[
         "dill>=0.3.2,<0.4",
         "msgpack>=1.0.0,<1.1.0",

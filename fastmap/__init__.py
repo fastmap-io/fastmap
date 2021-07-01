@@ -1,13 +1,13 @@
 from .sdk_lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity,
-                      FastmapException, ReturnType, CLIENT_VERSION, INIT_DOCSTRING,
-                      GLOBAL_INIT_DOCSTRING, FASTMAP_DOCSTRING, OFFLOAD_DOCSTRING,
+                      FastmapException, CLIENT_VERSION, INIT_DOCSTRING,
+                      GLOBAL_INIT_DOCSTRING, MAP_DOCSTRING, OFFLOAD_DOCSTRING,
                       POLL_DOCSTRING, POLL_ALL_DOCSTRING, KILL_DOCSTRING,
-                      RESULT_DOCSTRING, CLEAR_DOCSTRING, CLEAR_ALL_DOCSTRING,
-                      LOGS_DOCSTRING)
+                      RETURN_VALUE_DOCSTRING, TRACEBACK_DOCSTRING, WAIT_DOCSTRING,
+                      CLEAR_DOCSTRING, CLEAR_ALL_DOCSTRING,
+                      NEW_LOGS_DOCSTRING, ALL_LOGS_DOCSTRING)
 
 ExecPolicy = ExecPolicy
 Verbosity = Verbosity
-ReturnType = ReturnType
 FastmapException = FastmapException
 FastmapConfig = FastmapConfig
 
@@ -23,7 +23,7 @@ def global_init(*args, **kwargs):
 
 @set_docstring(INIT_DOCSTRING)
 def init(*args, **kwargs):
-    return FastmapConfig(*args, **kwargs)
+    return FastmapConfig.create(*args, **kwargs)
 
 
 def _get_config():
@@ -35,9 +35,9 @@ def _get_config():
     return tmp_config
 
 
-@set_docstring(FASTMAP_DOCSTRING)
-def fastmap(func, iterable, *args, **kwargs):
-    return _get_config().fastmap(func, iterable, *args, **kwargs)
+# @set_docstring(MAP_DOCSTRING)
+# def map(func, iterable, *args, **kwargs):
+#     return _get_config().map(func, iterable, *args, **kwargs)
 
 
 @set_docstring(OFFLOAD_DOCSTRING)
@@ -60,14 +60,29 @@ def kill(task_id):
     return _get_config().kill(task_id)
 
 
-@set_docstring(RESULT_DOCSTRING)
-def result(task_id):
-    return _get_config().result(task_id)
+@set_docstring(RETURN_VALUE_DOCSTRING)
+def return_value(task_id):
+    return _get_config().return_value(task_id)
 
 
-@set_docstring(LOGS_DOCSTRING)
-def logs(task_id):
-    return _get_config().logs(task_id)
+@set_docstring(TRACEBACK_DOCSTRING)
+def traceback(task_id):
+    return _get_config().traceback(task_id)
+
+
+@set_docstring(WAIT_DOCSTRING)
+def wait(task_id, *args, **kwargs):
+    return _get_config().wait(task_id, *args, **kwargs)
+
+
+@set_docstring(ALL_LOGS_DOCSTRING)
+def all_logs(task_id, *args, **kwargs):
+    return _get_config().logs(task_id, *args, **kwargs)
+
+
+@set_docstring(NEW_LOGS_DOCSTRING)
+def new_logs(task_id, *args, **kwargs):
+    return _get_config().logs(task_id, *args, **kwargs)
 
 
 @set_docstring(CLEAR_DOCSTRING)
