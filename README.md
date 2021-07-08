@@ -1,13 +1,22 @@
 > Note: Fastmap is currently in beta. 
 
-![Version 0.0.7](https://img.shields.io/badge/version-0.0.7-red)
+![Version 0.0.8](https://img.shields.io/badge/version-0.0.8-red)
 
 <p align="center">
     <img alt="fastmap logo" src="assets/fastmap_logo.png" width="400" />
 </p>
 
-Fastmap is a drop-in replacement for `map` that makes your Python code in parallel on the cloud. Fastmap is appropriate to use when `map` is too slow but setting up custom infrastructure would be overkill.
+Fastmap offloads and parallelizes arbitrary Python functions on the cloud.
 
+- **🌤  Offload anything** Fastmap is the easiest way to offload Python code. Use fastmap.offload wherever you would might have needed an EC2.
+- **🔗  Parallelize in one line** With Fastmap, you can parallelize any Python function across as many workers as it takes. Use fastmap.map wherever you might have needed a Lambda.
+- **🚀  Deploy in minutes** Fastmap comes with an open-source cloud service. With a Google Cloud Platform account, you can setup and deploy fastmap with one command.
+- ** 🛀  Built for productivity** Fastmap is designed to eliminate infrastructure and speed up your work. Spend your time writing code - not fighting infrastructure.
+
+Fastmap is in active development. For more information, see https://fastmap.io.
+
+
+<!-- 
 ![Demo gif of fastmap](assets/demo.gif)
 
 - **🚀 Speed up parallel tasks**. Fastmap automatically parallelizes your code and distributes work locally and on the cloud.
@@ -88,3 +97,4 @@ If in doubt, try running fastmap with a small test dataset. Fastmap attempts to 
 ### Questions
 
 Fastmap.io is a new project and I would love to hear your feedback. You can contact me directly at scott@fastmap.io.
+ -->

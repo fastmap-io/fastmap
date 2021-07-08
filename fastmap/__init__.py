@@ -27,12 +27,9 @@ def init(*args, **kwargs):
 
 
 def _get_config():
-    if _global_config:
-        return _global_config
-    tmp_config = init(exec_policy=ExecPolicy.LOCAL)
-    tmp_config.log.warning("Fastmap not initialized globally."
-                           "Defaulting to LOCAL exec_policy.")
-    return tmp_config
+    if not _global_config:
+        raise FastmapException("Fastmap not initialized globally.")
+    return _global_config
 
 
 # @set_docstring(MAP_DOCSTRING)
@@ -91,8 +88,8 @@ def clear(task_id):
 
 
 @set_docstring(CLEAR_ALL_DOCSTRING)
-def clear_all(task_id):
-    return _get_config().clear_all(task_id)
+def clear_all():
+    return _get_config().clear_all()
 
 
 def _reset_global_config():
