@@ -37,7 +37,7 @@ SECRET_RE = r'^[0-9a-f]{64}$'
 TASK_RE = r'^[0-9a-f]{8}$'
 SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
 REQUIREMENT_RE = re.compile(r'^[A-Za-z0-9_-]+==\d+(?:\.\d+)*$')
-CLIENT_VERSION = "0.0.8"
+CLIENT_VERSION = "0.0.9"
 KB = 1024
 MB = 1024 ** 2
 GB = 1024 ** 3
@@ -185,8 +185,8 @@ INIT_PARAMS = """
     :param str verbosity: 'SILENT', 'QUIET', 'NORMAL', or 'LOUD'.
         Default is 'NORMAL'.
     :param str exec_policy: 'LOCAL' or 'CLOUD'. Default is 'CLOUD'.
-    :param str machine_type: 'CPU' or 'GPU'. Only for the CLOUD exec_policy.
-        Default is 'CPU'.
+    :param str machine_type: 'CPU1', 'CPU7', or 'GPU7'. Only for the CLOUD exec_policy.
+        Default is 'CPU1'.
     :param list requirements: A list of requirements in "package==1.2.3" style.
         If omitted, requirement discovery is automatic.
 
@@ -266,7 +266,7 @@ MapStatus = Namespace("NOT_FOUND", "BATCH_PROCESSED", "INITALIZING", "INITIALIZA
 DoneStatus = Namespace("DONE", "NOT_FOUND")
 TaskState = Namespace("PENDING", "PROCESSING", "KILLING", "FINISHING", "DONE", "CLEARED")
 TaskOutcome = Namespace("SUCCESS", "ERROR", "KILLED_BY_REQUEST", "KILLED_ZOMBIE")
-MachineType = Namespace("CPU", "GPU")
+MachineType = Namespace("CPU1", "CPU7", "GPU7")
 Color = Namespace(
     GREEN="\033[92m",
     RED="\033[91m",
@@ -281,7 +281,7 @@ DEFAULT_INLINE_CONFIG = {
     'cloud_url': None,
     'verbosity': Verbosity.NORMAL,
     'exec_policy': ExecPolicy.CLOUD,
-    'machine_type': MachineType.CPU,
+    'machine_type': MachineType.CPU1,
     'requirements': None,
 }
 
@@ -1052,7 +1052,7 @@ class FastmapTask():
                 raise FastmapException(msg)
             self._config.log.info(msg)
 
-        self._config.log.debug("Waiting for task to finish...")
+        self._config.log.info("Waiting for task to finish...")
 
         while True:
             if live_logs:
@@ -1259,7 +1259,7 @@ class FastmapCloudTask(FastmapTask):
             "func_name": func_name,
             "func_hash": func_hash,
             "label": label,
-            'machine_type': config.machine_type,
+            "machine_type": config.machine_type,
         }
         config.log.info("Starting new task for function %r..." % func_name)
         try:
@@ -1476,9 +1476,6 @@ class FastmapConfig():
         "verbosity",
         "log",
         "exec_policy",
-        # "confirm_charges",
-        # "max_local_workers",
-        # "max_cloud_workers",
         "machine_type",
         "cloud_url",
         "requirements",
@@ -1486,14 +1483,11 @@ class FastmapConfig():
     ]
 
     def __init__(self, config):
-
+        # TODO parameter checking is weirdly divided between create and init
         self.exec_policy = config['exec_policy']
         self.log = FastmapLogger(config['verbosity'])
         self.verbosity = config['verbosity']
         self.cloud_url = config['cloud_url']
-        # self.live_logs = config['live_logs']
-        # self.confirm_charges = config['confirm_charges']
-        # self.max_cloud_workers = config['max_cloud_workers']
         self.requirements = config['requirements']
         self.machine_type = config['machine_type']
         self.local_threads = []
