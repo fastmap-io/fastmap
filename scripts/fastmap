@@ -129,6 +129,11 @@ def logs(config, task_id):
     print(logs)
 
 
+def retry(config, task_id):
+    new_task = config.retry(task_id)
+    config.log.info("Retry in process %r" % new_task)
+
+
 def clear(config, task_id, force=False):
     if task_id:
         cleared_tasks = [config.clear(task_id)]
@@ -222,6 +227,13 @@ if __name__ == "__main__":
         '--force', action='store_true',
         help='When task_id is omitted, kill all tasks without confirmation')
 
+    retry_p = subparsers.add_parser(
+        'retry',
+        help='Retry a task in a DONE state')
+    retry_p.add_argument(
+        "task_id",
+        help="Task to retry")
+
     clear_p = subparsers.add_parser(
         'clear',
         help="Clear a completed task")
@@ -252,6 +264,8 @@ if __name__ == "__main__":
         traceback(config, args.task_id)
     if args.operation == 'kill':
         kill(config, args.task_id, args.force)
+    if args.operation == 'retry':
+        retry(config, args.task_id)
     if args.operation == 'logs':
         logs(config, args.task_id)
     if args.operation == 'clear':

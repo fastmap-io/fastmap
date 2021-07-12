@@ -3,8 +3,8 @@ from .sdk_lib import (FastmapConfig, set_docstring, ExecPolicy, Verbosity,
                       GLOBAL_INIT_DOCSTRING, MAP_DOCSTRING, OFFLOAD_DOCSTRING,
                       POLL_DOCSTRING, POLL_ALL_DOCSTRING, KILL_DOCSTRING,
                       RETURN_VALUE_DOCSTRING, TRACEBACK_DOCSTRING, WAIT_DOCSTRING,
-                      CLEAR_DOCSTRING, CLEAR_ALL_DOCSTRING,
-                      NEW_LOGS_DOCSTRING, ALL_LOGS_DOCSTRING)
+                      CLEAR_DOCSTRING, CLEAR_ALL_DOCSTRING, RETRY_DOCSTRING,
+                      ALL_LOGS_DOCSTRING)
 
 ExecPolicy = ExecPolicy
 Verbosity = Verbosity
@@ -74,12 +74,7 @@ def wait(task_id, *args, **kwargs):
 
 @set_docstring(ALL_LOGS_DOCSTRING)
 def all_logs(task_id, *args, **kwargs):
-    return _get_config().logs(task_id, *args, **kwargs)
-
-
-@set_docstring(NEW_LOGS_DOCSTRING)
-def new_logs(task_id, *args, **kwargs):
-    return _get_config().logs(task_id, *args, **kwargs)
+    return _get_config().all_logs(task_id, *args, **kwargs)
 
 
 @set_docstring(CLEAR_DOCSTRING)
@@ -90,6 +85,11 @@ def clear(task_id):
 @set_docstring(CLEAR_ALL_DOCSTRING)
 def clear_all():
     return _get_config().clear_all()
+
+
+@set_docstring(RETRY_DOCSTRING)
+def retry(task_id):
+    return _get_config().retry(task_id)
 
 
 def _reset_global_config():

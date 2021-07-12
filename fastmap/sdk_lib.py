@@ -37,7 +37,7 @@ SECRET_RE = r'^[0-9a-f]{64}$'
 TASK_RE = r'^[0-9a-f]{8}$'
 SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
 REQUIREMENT_RE = re.compile(r'^[A-Za-z0-9_-]+==\d+(?:\.\d+)*$')
-CLIENT_VERSION = "0.0.9"
+CLIENT_VERSION = "0.0.10"
 KB = 1024
 MB = 1024 ** 2
 GB = 1024 ** 3
@@ -93,7 +93,7 @@ POLL_ALL_DOCSTRING = """
     """
 
 POLL_DOCSTRING = """
-    Given a task_id, poll for cloud task metadata.
+    Poll for cloud task metadata.
 
     Raises a FastmapException if the task cannot be found.
 
@@ -102,15 +102,16 @@ POLL_DOCSTRING = """
     """
 
 KILL_DOCSTRING = """
-    Given a task_id, kill the associated cloud task.
+    Kill the associated cloud task.
 
     Raises a FastmapException if the task cannot be found or is already dead.
 
     :param str task_id:
+    :rtype: None
     """
 
 WAIT_DOCSTRING = """
-    Given a task_id, block until the task completes. If the task is
+    Block until the task completes. If the task is
     ultimately successful, return the function's return value.
 
     Raises a FastmapException if the result cannot be found,
@@ -124,7 +125,7 @@ WAIT_DOCSTRING = """
     """
 
 RETURN_VALUE_DOCSTRING = """
-    Given a task_id, return the function's return value.
+    Return the function's return value.
 
     Raises a FastmapException if the result cannot be found,
     if task has not completed, or if the task was not successful.
@@ -134,7 +135,7 @@ RETURN_VALUE_DOCSTRING = """
     """
 
 TRACEBACK_DOCSTRING = """
-    Given a task_id, return the traceback of an errored task.
+    Return the traceback of an errored task.
 
     Raises a FastmapException if the result cannot be found,
     if task has not completed, or if the task did not error.
@@ -144,7 +145,7 @@ TRACEBACK_DOCSTRING = """
     """
 
 ALL_LOGS_DOCSTRING = """
-    Given a task_id, return the task's stdout and stderr since the task started.
+    Return the task's stdout and stderr since the task started.
 
     Raises a FastmapException if the task cannot be found.
 
@@ -152,7 +153,7 @@ ALL_LOGS_DOCSTRING = """
     """
 
 NEW_LOGS_DOCSTRING = """
-    Given a task_id, return the task's stdout and stderr since the task started.
+    Return the task's stdout and stderr since the task started.
 
     Raises a FastmapException if the task cannot be found.
 
@@ -160,12 +161,20 @@ NEW_LOGS_DOCSTRING = """
     """
 
 CLEAR_DOCSTRING = """
-    Given a task_id, clear the task and remove its function, logs, and result from storage.
+    Clear the task and remove its function, logs, and result from storage.
 
     Raises a FastmapException if the task cannot be found or the
     task has not completed.
 
     :param str task_id:
+    :rtype: None
+    """
+
+RETRY_DOCSTRING = """
+    Retry the task. Returns a new FastmapTask
+
+    :param str task_id:
+    :rtype: FastmapTask
     """
 
 CLEAR_ALL_DOCSTRING = """
@@ -350,7 +359,7 @@ def get_credits(seconds: float, bytes_egress: float) -> float:
     return 8 * (seconds * 10.0 / 3600.0 + bytes_egress * 10.0 / GB)
 
 
-def get_func_hash(pickled_func: bytes) -> str:
+def get_hash(binary: bytes) -> str:
     """
     Get the function hash for a dill pickled function.
     This is used mostly for caching and bucketing
@@ -367,7 +376,7 @@ def get_func_hash(pickled_func: bytes) -> str:
     Approach will be to find non-deteministic aspects of Python and replace
     them one-by-one in dill
     """
-    return hashlib.sha256(pickled_func).hexdigest()[:16]
+    return hashlib.sha256(binary).hexdigest()[:16]
 
 
 class FastmapException(Exception):
@@ -762,13 +771,26 @@ def get_modules(log: FastmapLogger) -> (Dict[str, str], List[ModuleType]):
     local_sources = {}
     installed_mods = []
     for mod_name, mod in sys.modules.items():
-        if (mod_name in sys.builtin_module_names or  # not builtin # noqa
-            mod_name.startswith("_") or  # not hidden # noqa
-            not getattr(mod, '__file__', None) or   # also not builtin # noqa
-            os.path.realpath(mod.__file__).startswith(std_lib_dir) or  # not stdlib # noqa
-            (hasattr(mod, "__package__") and  # noqa
-             mod.__package__ in ("fastmap", "fastmap.fastmap"))):  # not fastmap
-                continue  # noqa
+        if mod_name in sys.builtin_module_names:
+            # builtin
+            continue
+        if mod_name.startswith("_"):
+            # hidden
+            continue
+        if not getattr(mod, '__file__', None):
+            # also not builtin
+            continue
+        mod_path = os.path.realpath(mod.__file__)
+        if mod_path.startswith(std_lib_dir) and 'site-packages' not in mod_path:
+            # not stdlib
+            continue
+        if hasattr(mod, "__package__") and \
+           mod.__package__ in ("fastmap", "fastmap.fastmap"):
+            # not fastmap
+            continue
+
+        # Through with the silent skips.
+        # Looking for local_sources and installed_mods
         if SITE_PACKAGES_RE.match(mod.__file__):
             installed_mods.append(mod)
             continue
@@ -859,13 +881,16 @@ def get_dependencies(requirements: dict, log: FastmapLogger) -> (dict, dict):
     Values are either pip version strings or source code.
     """
     local_sources, installed_mods = get_modules(log)
-    requirements = requirements or get_requirements(installed_mods, log)
-    installed_mods = [im.__name__ for im in installed_mods]
-
     log.debug("Found %d installed modules" % len(installed_mods))
-    log.debug("Found requirements %r" % requirements)
     log.debug("Found local imports %r" % list(sorted(local_sources.keys())))
 
+    if requirements:
+        log.debug("Skipping requirements autodetect.")
+    else:
+        requirements = get_requirements(installed_mods, log)
+        log.info("Autodetected requirements %r." % requirements)
+
+    installed_mods = [im.__name__ for im in installed_mods]
     return local_sources, installed_mods, requirements
 
 
@@ -1217,6 +1242,10 @@ class FastmapLocalTask(FastmapTask):
         self._task_state = TaskState.DONE
         self.poll()
 
+    def retry(self):
+        # TODO
+        pass
+
     def _fetch_logs(self):
         self.poll()
         new_logs = ''
@@ -1379,6 +1408,24 @@ class FastmapCloudTask(FastmapTask):
                 self._logs_done = True
             return resp.obj['logs'].decode()
         raise FastmapException("Unexpected status from server %r" % resp.status)
+
+    def retry(self):
+        self._config.log.debug("Calling /api/v1/retry")
+        url = self._config.cloud_url + '/api/v1/retry'
+        payload = {"task_id": self.task_id}
+        try:
+            resp = post_request(url, payload, self._config.secret, self._config.log)
+        except CloudError as ex:
+            # TODO
+            raise ex
+        if resp.status != 'ACKNOWLEDGED':
+            # TODO more error handling
+            raise FastmapException("Server error doing retry")
+        new_task_dict = resp.obj['task']
+        new_task_id = new_task_dict['task_id']
+        self._config.log.info("Server is retrying task %s with new task %s" % (self.task_id, new_task_id))
+        # TODO hook for new retry
+        return FastmapCloudTask(self._config, task_id=new_task_id)
 
     def clear(self):
         self._config.log.debug("Calling /api/v1/clear")
@@ -1552,6 +1599,10 @@ class FastmapConfig():
                 raise FastmapException(f"Unknown parameter: {k}")
             c[k] = v
 
+        for k in DEFAULT_INLINE_CONFIG.keys():
+            if k not in c:
+                raise FastmapException(f"Missing configuration parameter: {k}")
+
         if c['machine_type'] not in MachineType:
             raise FastmapException(f"Unknown machine_type '{c['machine_type']}'.")
 
@@ -1629,6 +1680,11 @@ class FastmapCloudConfig(FastmapConfig):
         tasks = resp.obj['tasks']
         list(map(make_dt, tasks))
         return tasks
+
+    @check_task_id
+    @set_docstring(RETRY_DOCSTRING)
+    def retry(self, task_id):
+        return FastmapCloudTask(self, task_id=task_id).retry()
 
     @check_task_id
     @set_docstring(KILL_DOCSTRING)
@@ -1807,12 +1863,13 @@ def init_remote(config, func_hash, func_payload):
 def get_payload_and_hash(pickled_func, config):
     local_sources, installed_mods, requirements = get_dependencies(
         config.requirements, config.log)
-    encoded_func = msgpack.dumps({
+    func_payload = msgpack.dumps({
         'func': pickled_func,
         'local_sources': local_sources,
         'installed_mods': installed_mods,
         'requirements': requirements})
-    func_payload = gzip.compress(encoded_func, compresslevel=1)
-    func_hash = get_func_hash(func_payload)
-    return func_payload, func_hash
+    compressed_payload = gzip.compress(func_payload, compresslevel=1)
+    func_hash = get_hash(compressed_payload)
+    return compressed_payload, func_hash
+
 

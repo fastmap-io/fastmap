@@ -1,5 +1,8 @@
 # Fastmap CHANGELOG
 
+## [0.0.10] - 2021-07-12
+Several tweaks/fixes over the past few versions for test users
+
 ## [0.0.7] - 2021-07-01
 Major paradigm change. Fastmap is now oriented around a controller/worker approach.
 Map is still in dev. Unit tests have no chance. But this should work for
