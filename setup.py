@@ -36,6 +36,7 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     scripts=[
         "scripts/fastmap",
+        "scripts/fastmapadmin",
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

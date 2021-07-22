@@ -5,13 +5,13 @@ import argparse
 import tabulate
 import fastmap
 
-USAGE = """Fastmap CLI for running arbitrary Python functions on the cloud.
+USAGE = """Fastmap CLI.
 This CLI only supports the offload workflow and doesn't have any mapping functionality.
 Run `fastmap --help` for more details.
 """
 
 DESCRIPTION = """
-Fastmap CLI for offloading scripts.
+Fastmap CLI.
 \n\n
 Examples:
 $ fastmap poll <task_id>
@@ -84,7 +84,7 @@ def _prettify_tasks(tasks):
 
 def poll(config, task_id):
     if task_id:
-        tasks = [config.poll(task_id)]
+        tasks = [config.get_task(task_id).poll()]
     else:
         tasks = config.poll_all()
 
@@ -96,18 +96,18 @@ def poll(config, task_id):
 
 
 def return_value(config, task_id):
-    print(config.return_value(task_id))
+    print(config.get_task(task_id).return_value())
 
 
 def traceback(config, task_id):
-    tb = config.traceback(task_id)
+    tb = config.get_task(task_id).traceback()
     config.log.info("Traceback for %s:" % task_id)
     print(tb)
 
 
 def kill(config, task_id, force=False):
     if task_id:
-        config.kill(task_id)
+        config.get_task(task_id).kill()
         return
     config.log.info("Polling for tasks to kill...")
     tasks = config.poll_all()
@@ -119,24 +119,24 @@ def kill(config, task_id, force=False):
         if config.log.input("Kill %d tasks? (y/n) " % len(tasks_to_kill)).lower() != 'y':
             return
     for task in tasks_to_kill:
-        config.kill(task['task_id'])
+        config.get_task(task_id).kill()
     config.log.info("Killed %d tasks" % len(tasks_to_kill))
 
 
 def logs(config, task_id):
-    logs = config.all_logs(task_id)
+    logs = config.get_task(task_id).all_logs()
     config.log.info("Logs for %s:" % task_id)
     print(logs)
 
 
 def retry(config, task_id):
-    new_task = config.retry(task_id)
+    new_task = config.get_task(task_id).retry(task_id)
     config.log.info("Retry in process %r" % new_task)
 
 
 def clear(config, task_id, force=False):
     if task_id:
-        cleared_tasks = [config.clear(task_id)]
+        cleared_tasks = [config.get_task(task_id).clear()]
         return
 
     config.log.info("Polling for tasks to clear...")
@@ -168,7 +168,7 @@ if __name__ == "__main__":
              "If omitted, will attempt to use the default configuration. ")
     parser.add_argument(
         "--verbosity",
-        choices=("QUIET", "NORMAL", "LOUD"),
+        choices=("SILENT", "QUIET", "NORMAL", "LOUD"),
         help="How loud fastmap is. Default is NORMAL.",
         default="NORMAL")
 
@@ -197,8 +197,7 @@ if __name__ == "__main__":
 
     logs_p = subparsers.add_parser(
         'logs',
-        help="Get logs of a task. Task can be in any state except CLEARED. "
-             "Logs may be truncated. ")
+        help="Get logs of a task. Task can be in any state except CLEARED. ")
     logs_p.add_argument(
         "task_id",
         help="Task ID of task to get logs for.")
