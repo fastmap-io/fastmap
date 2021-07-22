@@ -1,5 +1,8 @@
 # Fastmap CHANGELOG
 
+## [0.0.11] - 2021-07-22
+Lots of cleanup and bug fixes. Add fastmapadmin script
+
 ## [0.0.10] - 2021-07-12
 Several tweaks/fixes over the past few versions for test users
 

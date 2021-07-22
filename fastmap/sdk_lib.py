@@ -37,7 +37,7 @@ SECRET_RE = r'^[0-9a-zA-Z]{64}$'
 TASK_RE = r'^[0-9a-zA-Z]{12}$'
 SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
 REQUIREMENT_RE = re.compile(r'^[A-Za-z0-9_-]+==\d+(?:\.\d+)*$')
-CLIENT_VERSION = "0.0.10"
+CLIENT_VERSION = "0.0.11"
 KB = 1024
 MB = 1024 ** 2
 GB = 1024 ** 3
