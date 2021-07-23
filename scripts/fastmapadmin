@@ -20,6 +20,7 @@ EPILOG = """Run `fastmap <operation> --help` for help on individual operations."
 
 
 def _relative_time(seconds):
+    seconds = datetime.datetime.utcnow().timestamp() - seconds
     if not seconds:
         return 'never'
     if seconds > 60 * 60 * 24 * 2:
@@ -36,8 +37,14 @@ def _relative_time(seconds):
 
 def _prettify(items):
     for item in items:
-        item['created'] = datetime.datetime.fromtimestamp(item['created']).strftime("%Y-%m-%d %H:%M:%S")
-        item['updated'] = datetime.datetime.fromtimestamp(item['updated']).strftime("%Y-%m-%d %H:%M:%S")
+        item['created'] = _relative_time(item['created'])
+        item['updated'] = _relative_time(item['updated'])
+
+        if item.get('idle'):
+            item['idle'] = _relative_time(item['idle'])
+
+        if item.get('heartbeat_ts'):
+            item['heartbeat_ts'] = _relative_time(item['heartbeat_ts'])
         # task['state'] = task['task_state']
         # task['id'] = task['task_id']
 
@@ -48,9 +55,9 @@ def _prettify(items):
         # task['progress'] = task['progress'] and "%.1f%%" % task['progress']
 
 
-def get_accounts(config):
+def list_accounts(config):
     resp = fastmap.sdk_lib.post_request(
-        url=config.cloud_url + '/accounts',
+        url=config.cloud_url + '/admin/v1/list_accounts',
         data={},
         secret=config.secret,
         log=fastmap.sdk_lib.FastmapLogger('QUIET'))
@@ -61,9 +68,23 @@ def get_accounts(config):
     print(tabulate.tabulate(accounts, headers='keys'))
 
 
+def list_workers(config):
+    resp = fastmap.sdk_lib.post_request(
+        url=config.cloud_url + '/admin/v1/list_workers',
+        data={},
+        secret=config.secret,
+        log=fastmap.sdk_lib.FastmapLogger('QUIET'))
+
+    workers = resp.obj['workers']
+    workers.sort(key=lambda x: x['created'], reverse=True)
+    import pprint; pprint.pprint(workers)
+    _prettify(workers)
+    print(tabulate.tabulate(workers, headers='keys'))
+
+
 def add_account(config, email, password):
     resp = fastmap.sdk_lib.post_request(
-        url=config.cloud_url + '/add_account',
+        url=config.cloud_url + '/admin/v1/add_account',
         data={'email': email, 'password': password},
         secret=config.secret,
         log=fastmap.sdk_lib.FastmapLogger('QUIET'))
@@ -74,8 +95,9 @@ def add_account(config, email, password):
 
 
 def add_credits(config, account_id, amount):
+    # TODO check account_id
     resp = fastmap.sdk_lib.post_request(
-        url=config.cloud_url + '/add_credit',
+        url=config.cloud_url + '/admin/v1/add_credit',
         data={'account_id': account_id, 'amount': amount},
         secret=config.secret,
         log=fastmap.sdk_lib.FastmapLogger('QUIET'))
@@ -99,8 +121,11 @@ if __name__ == "__main__":
         dest='operation', required=True,
         help='sub-command help')
 
-    get_accounts_p = subparsers.add_parser(
-        'get_accounts', help="Get account info")
+    list_accounts_p = subparsers.add_parser(
+        'list_accounts', help="Get account info")
+
+    list_workers_p = subparsers.add_parser(
+        'list_workers', help="Get worker info")
 
     add_credits_p = subparsers.add_parser(
         'add_credits', help="Add credits to users")
@@ -128,8 +153,10 @@ if __name__ == "__main__":
         raise AssertionError("The fastmap CLI does not support a LOCAL exec_policy. "
                              "Check your configuration file.")
 
-    if args.operation == 'get_accounts':
-        get_accounts(config)
+    if args.operation == 'list_accounts':
+        list_accounts(config)
+    if args.operation == 'list_workers':
+        list_workers(config)
     if args.operation == 'add_credits':
         add_credits(config, args.account_id, args.amount)
     if args.operation == 'add_account':

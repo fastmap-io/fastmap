@@ -1,6 +1,6 @@
 > Note: Fastmap is currently in beta. 
 
-![Version 0.0.10](https://img.shields.io/badge/version-0.0.10-red)
+![Version 0.0.12](https://img.shields.io/badge/version-0.0.12-red)
 
 <p align="center">
     <img alt="fastmap logo" src="assets/fastmap_logo.png" width="400" />

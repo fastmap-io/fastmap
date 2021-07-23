@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import getpass
+import json
+import os
 
-import tabulate
 import fastmap
+import requests
+import tabulate
 
 USAGE = """Fastmap CLI.
 This CLI only supports the offload workflow and doesn't have any mapping functionality.
@@ -27,6 +31,7 @@ $ fastmap clear --force
 
 EPILOG = """Run `fastmap <operation> --help` for help on individual operations."""
 
+DEFAULT_CONFIG_DIR = fastmap.sdk_lib.DEFAULT_CONFIG_DIR
 
 def _relative_time(seconds):
     if not seconds:
@@ -80,6 +85,24 @@ def _prettify_tasks(tasks):
 #                              (func, mod_path)) from None
 #     fastmap_task = config.offload(func, label=label)
 #     config.log.info("Started new task: %s" % fastmap_task.task_id)
+
+def login(service_url):
+    email = input("Email: ")
+    password = getpass.getpass("Password: ")
+    resp = requests.post(service_url + '/actions/v1/login',
+                         data=json.dumps({'email': email, 'password': password}))
+    if resp.status_code != 200:
+        raise AssertionError("Could not login with those credentials")
+    resp_dict = json.loads(resp.content)
+    config = dict(fastmap.sdk_lib.DEFAULT_INLINE_CONFIG)
+    config['secret'] = resp_dict['session_token']
+    config['cloud_url'] = service_url
+    config_dir = os.path.dirname(DEFAULT_CONFIG_DIR)
+    if not os.path.exists(config_dir):
+        os.mkdir(config_dir)
+    with open(DEFAULT_CONFIG_DIR, 'w') as f:
+        f.write(json.dumps(config, indent=4))
+    print("Login successful. Configuration is at %s." % DEFAULT_CONFIG_DIR)
 
 
 def poll(config, task_id):
@@ -189,6 +212,12 @@ if __name__ == "__main__":
     #     "label", nargs='?',
     #     help="Optional label for your use")
 
+    login_p = subparsers.add_parser(
+        'login', help="Login to a fastmap service")
+    login_p.add_argument(
+        '--service-url', default='https://app.fastmap.io',
+        help="Which fastmap service to use. Default: https://app.fastmap.io")
+
     poll_p = subparsers.add_parser(
         'poll', help="Get the metadata of one or all tasks")
     poll_p.add_argument(
@@ -245,8 +274,25 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.operation == 'login':
+        login(args.service_url)
+        exit(0)
+
+    if args.config:
+        try:
+            with open(args.config) as f:
+                config_json = json.loads(f.read())
+        except:
+            raise AssertionError("Error loading configuration %r" % args.config)
+    else:
+        try:
+            with open(DEFAULT_CONFIG_DIR) as f:
+                config_json = json.loads(f.read())
+        except:
+            raise AssertionError("No default configuration available. Try running `fastmap login`.")
+
     config = fastmap.init(
-        config=args.config,
+        config=config_json,
         verbosity=args.verbosity)
 
     if config.exec_policy == fastmap.ExecPolicy.LOCAL:

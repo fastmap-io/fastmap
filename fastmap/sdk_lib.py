@@ -37,7 +37,7 @@ SECRET_RE = r'^[0-9a-zA-Z]{64}$'
 TASK_RE = r'^[0-9a-zA-Z]{12}$'
 SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
 REQUIREMENT_RE = re.compile(r'^[A-Za-z0-9_-]+==\d+(?:\.\d+)*$')
-CLIENT_VERSION = "0.0.11"
+CLIENT_VERSION = "0.0.12"
 KB = 1024
 MB = 1024 ** 2
 GB = 1024 ** 3
@@ -306,7 +306,7 @@ def set_docstring(docstr: str, docstr_prefix='') -> FunctionType:
 
 
 def nowstamp() -> int:
-    return datetime.datetime.now().timestamp()
+    return datetime.datetime.utcnow().timestamp()
 
 
 def fmt_bytes(num_bytes: int) -> str:
@@ -591,7 +591,7 @@ def post_request(url: str, data: dict, secret: str,
 
     if resp.status_code == 401:
         # UNAUTHORIZED
-        raise FastmapException("Unauthorized. Check your API token.")
+        raise FastmapException(resp.headers['X-Reason'])
 
     if resp.status_code == 402:
         # NOT_ENOUGH_CREDITS

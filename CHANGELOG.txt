@@ -1,5 +1,8 @@
 # Fastmap CHANGELOG
 
+## [0.0.12] - 2021-07-23
+Added login option for fastmap to make credentials easier to manage. Bugfixes.
+
 ## [0.0.11] - 2021-07-22
 Lots of cleanup and bug fixes. Add fastmapadmin script
 
