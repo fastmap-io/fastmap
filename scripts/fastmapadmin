@@ -20,9 +20,9 @@ EPILOG = """Run `fastmap <operation> --help` for help on individual operations."
 
 
 def _relative_time(seconds):
-    seconds = datetime.datetime.utcnow().timestamp() - seconds
     if not seconds:
         return 'never'
+    seconds = datetime.datetime.now(datetime.timezone.utc).timestamp() - seconds
     if seconds > 60 * 60 * 24 * 2:
         return '%d days ago' % (seconds // (60 * 60 * 24))
     elif seconds > 60 * 60 * 2:

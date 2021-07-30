@@ -33,10 +33,10 @@ import dill
 import msgpack
 import requests
 
-SECRET_RE = r'^[0-9a-zA-Z]{64}$'
+SECRET_RE = r'^[PS]\-[0-9a-zA-Z]{64}$'
 TASK_RE = r'^[0-9a-zA-Z]{12}$'
 SITE_PACKAGES_RE = re.compile(r".*?/python[0-9.]+/(?:site|dist)\-packages/")
-REQUIREMENT_RE = re.compile(r'^[A-Za-z0-9_-]+==\d+(?:\.\d+)*$')
+REQUIREMENT_RE = re.compile(r'^[\w-]+==[\w-]+(?:\.[\w-]+)*$')
 CLIENT_VERSION = "0.0.12"
 KB = 1024
 MB = 1024 ** 2
@@ -194,8 +194,8 @@ INIT_PARAMS = """
     :param str verbosity: 'SILENT', 'QUIET', 'NORMAL', or 'LOUD'.
         Default is 'NORMAL'.
     :param str exec_policy: 'LOCAL' or 'CLOUD'. Default is 'CLOUD'.
-    :param str machine_type: 'CPU_1', 'CPU_7', or 'GPU_7'. Only for the CLOUD exec_policy.
-        Default is 'CPU_1'.
+    :param str machine_type: 'SPARROW_1', 'PEREGRINE_4', or 'HUMMINGBIRD_7'. Only
+        for the CLOUD exec_policy. Default is 'SPARROW_1'.
     :param list requirements: A list of requirements in "package==1.2.3" style.
         If omitted, requirement discovery is automatic.
 
@@ -275,7 +275,7 @@ MapStatus = Namespace("NOT_FOUND", "BATCH_PROCESSED", "INITALIZING", "INITIALIZA
 DoneStatus = Namespace("DONE", "NOT_FOUND")
 TaskState = Namespace("PENDING", "PROCESSING", "KILLING", "FINISHING", "DONE", "CLEARED")
 TaskOutcome = Namespace("SUCCESS", "ERROR", "KILLED_BY_REQUEST", "KILLED_ZOMBIE")
-MachineType = Namespace("CPU_1", "CPU_7", "GPU_7")
+MachineType = Namespace("SPARROW_1", "PEREGRINE_4", "HUMMINGBIRD_7")
 Color = Namespace(
     GREEN="\033[92m",
     RED="\033[91m",
@@ -290,7 +290,7 @@ DEFAULT_INLINE_CONFIG = {
     'cloud_url': 'https://app.fastmap.io',
     'verbosity': Verbosity.NORMAL,
     'exec_policy': ExecPolicy.CLOUD,
-    'machine_type': MachineType.CPU_1,
+    'machine_type': MachineType.SPARROW_1,
     'requirements': None,
 }
 
@@ -306,7 +306,7 @@ def set_docstring(docstr: str, docstr_prefix='') -> FunctionType:
 
 
 def nowstamp() -> int:
-    return datetime.datetime.utcnow().timestamp()
+    return datetime.datetime.now(datetime.timezone.utc).timestamp()
 
 
 def fmt_bytes(num_bytes: int) -> str:
@@ -530,13 +530,13 @@ class FastmapLogger():
 
 
 def auth_token(secret: str) -> str:
-    """ The auth token is the first half of the secret """
-    return secret[:32]
+    """ The auth token is the first half of the secret plus the P/S signifier """
+    return secret[:34]
 
 
 def sign_token(secret: str) -> str:
     """ The sign token is the first half of the secret """
-    return secret[32:]
+    return secret[34:]
 
 
 def hmac_digest(secret: str, payload: bytes) -> str:
@@ -1134,7 +1134,7 @@ def gen_id(chars=12):
 class FastmapLocalTask(FastmapTask):
     def __init__(self, config, func_name, task_type, proc=None, func_payload=None,
                  result_queue=None, logs_queue=None, heartbeat_queue=None,
-                 hook=None, label=''):
+                 hook=None, webhook=None, label=''):
         self.task_id = gen_id()
         self.task_type = task_type
         self._config = config
@@ -1143,6 +1143,7 @@ class FastmapLocalTask(FastmapTask):
         self._func_payload = func_payload
         self._label = label
         self._hook = hook
+        self._webhook = webhook
         self._outcome = None
         self._result_dict = None
         self._runtime = None
@@ -1156,7 +1157,7 @@ class FastmapLocalTask(FastmapTask):
         self._starttime = nowstamp()
 
     @staticmethod
-    def create(config, func_payload, func_name, hook, label):
+    def create(config, func_payload, func_name, hook, webhook, label):
         result_queue = multiprocessing.Queue()
         logs_queue = multiprocessing.Queue()
         heartbeat_queue = multiprocessing.Queue()
@@ -1172,20 +1173,20 @@ class FastmapLocalTask(FastmapTask):
         fp = FastmapLocalTask(config, func_name, "OFFLOAD", proc=proc,
                               func_payload=func_payload, result_queue=result_queue,
                               logs_queue=logs_queue, heartbeat_queue=heartbeat_queue,
-                              label=label, hook=hook)
+                              label=label, hook=hook, webhook=webhook)
         if hook:
             fp.add_hook(hook)
         return fp
 
     @staticmethod
-    def create_map(config, func_payload, func_name, iterable, hook, label):
+    def create_map(config, func_payload, func_name, iterable, hook, webhook, label):
         pickled_iterable = dill.dumps(iterable)
         result_queue = multiprocessing.Queue()
         logs_queue = multiprocessing.Queue()
         heartbeat_queue = multiprocessing.Queue()
         proc = multiprocessing.Process(target=local_map_wrapper,
                                        args=(func_payload, pickled_iterable,
-                                             result_queue, logs_queue, heartbeat_queue)) # TODO heartbeat_queue
+                                             result_queue, logs_queue, webhook, heartbeat_queue)) # TODO heartbeat_queue
         try:
             proc.start()
         except RuntimeError:
@@ -1241,7 +1242,8 @@ class FastmapLocalTask(FastmapTask):
 
     def retry(self):
         return FastmapLocalTask.create(self._config, self._func_payload,
-                                       self._func_name, self._hook, self._label)
+                                       self._func_name, self._hook, self._webhook,
+                                       self._label)
 
     def _fetch_logs(self):
         self.poll()
@@ -1279,18 +1281,19 @@ class FastmapCloudTask(FastmapTask):
         self._result_dict = None
 
     @staticmethod
-    def create(config, func_name, func_hash, hook, label):
+    def create(config, func_name, func_hash, hook, webhook, label):
         url = config.cloud_url + "/api/v1/offload"
         payload = {
             "func_name": func_name,
             "func_hash": func_hash,
             "label": label,
             "machine_type": config.machine_type,
+            "webhook": webhook,
         }
 
         # TODO
-        if config.machine_type != MachineType.CPU_1:
-            raise FastmapException("Only CPU_1 machine_type is supported right now")
+        if config.machine_type == MachineType.HUMMINGBIRD_7:
+            raise FastmapException("Only SPARROW_1 & PEREGRINE_4 machine_type are supported right now")
 
         config.log.info("Starting new task for function %r..." % func_name)
         resp = post_request(url, payload, config.secret, config.log)
@@ -1307,13 +1310,14 @@ class FastmapCloudTask(FastmapTask):
         raise FastmapException("Got unexpected response from server %r" % resp.status)
 
     @staticmethod
-    def create_map(config, func_name, func_hash, iterable, kwargs, hook, label):
+    def create_map(config, func_name, func_hash, iterable, kwargs, hook, webhook, label):
         url = config.cloud_url + "/api/v1/map"
         payload = {
             "func_name": func_name,
             "func_hash": func_hash,
             "kwargs": kwargs,
             "label": label,
+            "webhook": webhook,
         }
         config.log.debug("Calling /api/v1/map")
 
@@ -1400,9 +1404,9 @@ class FastmapCloudTask(FastmapTask):
         url = self._config.cloud_url + '/api/v1/retry'
         payload = {"task_id": self.task_id}
         resp = post_request(url, payload, self._config.secret, self._config.log)
-        if resp.status != 'ACKNOWLEDGED':
+        if resp.status == 'NOT_FOUND':
             # TODO more error handling
-            raise FastmapException("Server error doing retry")
+            raise FastmapException("Could not find task to retry")
         new_task_dict = resp.obj['task']
         new_task_id = new_task_dict['task_id']
         self._config.log.info("Server is retrying task %s with new task %s" % (self.task_id, new_task_id))
@@ -1591,7 +1595,7 @@ class FastmapConfig():
 
     @set_docstring(OFFLOAD_DOCSTRING)
     def offload(self, func: FunctionType, kwargs=None,
-                hook=None, label=""):
+                hook=None, webhook=None, label=""):
         self.log.info("Fastmap offload." \
                       "\n  verbosity: %s." \
                       "\n  exec_policy: %s." % (self.verbosity, self.exec_policy))
@@ -1610,14 +1614,14 @@ class FastmapConfig():
 
         if self.exec_policy == ExecPolicy.LOCAL:
             task = FastmapLocalTask.create(self, func_payload, func_name=func_name,
-                                           hook=hook, label=label)
+                                           hook=hook, webhook=webhook, label=label)
             self.local_threads.append(task)
             return task
 
         assert self.exec_policy == ExecPolicy.CLOUD
         init_remote(self, func_hash, func_payload)
         return FastmapCloudTask.create(self, func_name=func_name, func_hash=func_hash,
-                                       hook=hook, label=label)
+                                       hook=hook, webhook=webhook, label=label)
 
 
 class FastmapLocalConfig(FastmapConfig):
@@ -1689,7 +1693,7 @@ class FastmapCloudConfig(FastmapConfig):
 
     #     if self.exec_policy == ExecPolicy.LOCAL:
     #         task = FastmapLocalTask.create_map(self, func_payload, func_name=func_name,
-    #                                            iterable=iterable, hook=hook, label=label)
+    #                                            iterable=iterable, hook=hook, webhook=webhook, label=label)
     #         self.local_threads.append(task)
     #         return task
 
@@ -1698,7 +1702,7 @@ class FastmapCloudConfig(FastmapConfig):
 
     #     return FastmapCloudTask.create_map(self, func_hash=func_hash,
     #                                        iterable=iterable,
-    #                                        hook=hook, label=label)
+    #                                        hook=hook, webhook=webhook, label=label)
 
     # @check_task_id
     # @set_docstring(POLL_DOCSTRING)
